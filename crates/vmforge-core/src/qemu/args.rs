@@ -39,6 +39,10 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
         push(k.to_string());
         push(v);
     };
+    // QEMU option-list values are comma-delimited, so a literal comma in a path
+    // is an option separator (injection). Escape by doubling commas — QEMU's
+    // documented rule. Applied to every `file=` we interpolate.
+    let esc = |p: &std::path::Path| p.display().to_string().replace(',', ",,");
 
     flag("-name", l.config.name.clone());
 
@@ -77,7 +81,7 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
     // Boot disk (virtio-blk).
     flag(
         "-drive",
-        format!("file={},if=virtio,format=qcow2", l.disk.display()),
+        format!("file={},if=virtio,format=qcow2", esc(l.disk)),
     );
 
     // Install media as a virtio CD-ROM. `-cdrom` defaults to if=ide, which the
@@ -85,7 +89,7 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
     if let Some(iso) = l.iso {
         flag(
             "-drive",
-            format!("file={},if=virtio,media=cdrom,format=raw", iso.display()),
+            format!("file={},if=virtio,media=cdrom,format=raw", esc(iso)),
         );
         flag("-boot", "order=dc".to_string());
     }
@@ -138,6 +142,8 @@ mod tests {
         VmConfig {
             id: Uuid::nil(),
             name: "test-vm".into(),
+            schema_version: 1,
+            dir_slug: "test-vm".into(),
             hardware: Hardware {
                 cpus: 4,
                 memory_mib: 2048,
@@ -146,6 +152,7 @@ mod tests {
             network: NetworkConfig::default(),
             display: Default::default(),
             iso: None,
+            metadata: Default::default(),
         }
     }
 
@@ -154,6 +161,35 @@ mod tests {
             .position(|a| a == key)
             .and_then(|i| args.get(i + 1))
             .map(String::as_str)
+    }
+
+    #[test]
+    fn drive_paths_with_commas_are_escaped() {
+        // A comma in a path must be doubled so QEMU treats it as literal, not
+        // an option separator (injection guard for the user-chosen ISO path).
+        let mut c = cfg();
+        c.iso = Some("/isos/weird,name.iso".into());
+        let disk = PathBuf::from("/vm/di,sk.qcow2");
+        let sock = PathBuf::from("/vm/qmp.sock");
+        let args = build_args(&QemuLaunch {
+            config: &c,
+            accel: Accelerator::Hvf,
+            guest_arch: "aarch64",
+            disk: &disk,
+            iso: Some(Path::new("/isos/weird,name.iso")),
+            firmware: Some(Path::new("/fw/x.fd")),
+            vnc_display: 1,
+            qmp: QmpEndpoint::UnixSocket(&sock),
+        });
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("file=/isos/weird,,name.iso,if=virtio,media=cdrom,format=raw"),
+            "iso comma not escaped: {joined}"
+        );
+        assert!(
+            joined.contains("file=/vm/di,,sk.qcow2,if=virtio,format=qcow2"),
+            "disk comma not escaped: {joined}"
+        );
     }
 
     #[test]

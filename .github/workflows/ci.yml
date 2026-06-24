@@ -27,15 +27,16 @@ jobs:
           node-version: 22
       - name: cargo fmt
         run: cargo fmt --all --check
-      - name: cargo clippy (core)
-        run: cargo clippy -p vmforge-core -- -D warnings
-      - name: core unit tests
-        run: cargo test -p vmforge-core
-      - name: frontend install + typecheck + build
+      - name: cargo clippy (workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: workspace unit tests
+        run: cargo test --workspace
+      - name: frontend install + typecheck + build + test
         run: |
           npm ci
           npm run typecheck
           npm run build
+          npm test
 
   # Per-OS compile matrix. build-engineer extends this to real `tauri build`
   # + signing + artifacts.

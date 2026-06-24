@@ -107,6 +107,17 @@ impl QmpClient {
         let status = ret.get("status").and_then(Value::as_str).unwrap_or("");
         Ok(map_status(status))
     }
+
+    /// Test-only placeholder client backed by a closed/empty stream. Used to
+    /// populate a registry entry whose process is checked via `try_wait`
+    /// (reaper) before any QMP I/O occurs. Never performs a handshake.
+    #[cfg(test)]
+    pub(crate) fn dummy() -> Self {
+        Self {
+            reader: BufReader::new(Box::new(tokio::io::empty())),
+            writer: Box::new(tokio::io::sink()),
+        }
+    }
 }
 
 /// Map a QMP run-state string to VMForge's [`VmState`].

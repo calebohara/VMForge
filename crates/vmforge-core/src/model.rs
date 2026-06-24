@@ -5,10 +5,30 @@
 //! IPC. Keep them serde-stable and platform-neutral — no raw paths baked
 //! to one OS.
 
+use crate::host::Accelerator;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub type VmId = Uuid;
+
+fn default_schema_version() -> u32 {
+    1
+}
+
+/// Free-form, non-engine metadata persisted alongside hardware config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VmMetadata {
+    /// RFC3339 UTC timestamp of creation.
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// RFC3339 UTC timestamp of last config write.
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub os_hint: Option<String>,
+}
 
 /// VM lifecycle. Transitions are driven by the engine and reflected from
 /// QMP `query-status`/events. See hypervisor-engineer's state machine.
@@ -29,6 +49,13 @@ pub enum VmState {
 pub struct VmConfig {
     pub id: VmId,
     pub name: String,
+    /// On-disk schema version of this VM's `vmforge.toml`.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// Sanitized directory slug under the library root. Immutable for the
+    /// VM's life; the directory never moves on rename.
+    #[serde(default)]
+    pub dir_slug: String,
     #[serde(default)]
     pub hardware: Hardware,
     #[serde(default)]
@@ -40,6 +67,8 @@ pub struct VmConfig {
     /// Path to boot/install ISO, if any.
     #[serde(default)]
     pub iso: Option<String>,
+    #[serde(default)]
+    pub metadata: VmMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +130,8 @@ pub struct PortForward {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DisplayConfig {
     /// Host VNC port the noVNC bridge connects to (assigned at launch).
-    #[serde(default)]
+    /// Runtime-only — never persisted to `vmforge.toml`.
+    #[serde(skip)]
     pub vnc_port: Option<u16>,
 }
 
@@ -111,4 +141,162 @@ pub struct VmSummary {
     pub id: VmId,
     pub name: String,
     pub state: VmState,
+    /// Accelerator this host will use (derived server-side, not persisted).
+    pub accelerator: Accelerator,
+    /// Whether the guest arch differs from the host (emulated). Always
+    /// `false` in Phase 2 — no `guest_arch` field yet.
+    pub emulated: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (3) Wire casing is snake/kebab/lowercase — never camelCase. This guards
+    /// the JSON boundary contract (decision #9). The full DTO snapshot lives in
+    /// the IPC crate; here we pin the shared enums the DTOs embed.
+    #[test]
+    fn json_wire_casing() {
+        assert_eq!(
+            serde_json::to_string(&VmState::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VmState::Defined).unwrap(),
+            "\"defined\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VmState::Stopped).unwrap(),
+            "\"stopped\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NetworkMode::User).unwrap(),
+            "\"user\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NetworkMode::HostOnly).unwrap(),
+            "\"host-only\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NetworkMode::Bridged).unwrap(),
+            "\"bridged\""
+        );
+        assert_eq!(serde_json::to_string(&Accelerator::Hvf).unwrap(), "\"hvf\"");
+        assert_eq!(serde_json::to_string(&Accelerator::Kvm).unwrap(), "\"kvm\"");
+        assert_eq!(serde_json::to_string(&Accelerator::Tcg).unwrap(), "\"tcg\"");
+    }
+
+    /// (E.1 #3) json_ipc_round_trip — the IPC boundary contract. Every enum and
+    /// DTO-equivalent struct that crosses Tauri IPC must serialize with exact,
+    /// stable snake/kebab/lowercase field names and enum strings. The DTOs
+    /// themselves live in `src-tauri`, but they are structural mirrors of these
+    /// model types (HardwareDto↔Hardware, DiskDto↔DiskSpec, NetworkDto↔
+    /// NetworkConfig, VmConfigDto/VmListItem fields), so pinning the model
+    /// boundary here pins the wire contract. Decision #9; never camelCase.
+    #[test]
+    fn json_ipc_round_trip() {
+        // Boundary enums — exact wire strings.
+        assert_eq!(
+            serde_json::to_string(&VmState::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NetworkMode::HostOnly).unwrap(),
+            "\"host-only\""
+        );
+        assert_eq!(serde_json::to_string(&Accelerator::Hvf).unwrap(), "\"hvf\"");
+
+        // Round-trip each enum (deserialize the wire string back).
+        assert_eq!(
+            serde_json::from_str::<VmState>("\"running\"").unwrap(),
+            VmState::Running
+        );
+        assert_eq!(
+            serde_json::from_str::<NetworkMode>("\"host-only\"").unwrap(),
+            NetworkMode::HostOnly
+        );
+        assert_eq!(
+            serde_json::from_str::<Accelerator>("\"hvf\"").unwrap(),
+            Accelerator::Hvf
+        );
+
+        // Helper: assert an object has exactly `keys` (order-insensitive).
+        fn assert_keys(v: &serde_json::Value, keys: &[&str]) {
+            let obj = v.as_object().expect("expected JSON object");
+            assert_eq!(obj.len(), keys.len(), "field count mismatch: {obj:?}");
+            for k in keys {
+                assert!(obj.contains_key(*k), "missing field {k}: {obj:?}");
+            }
+        }
+
+        // Hardware (↔ HardwareDto).
+        let hw = Hardware {
+            cpus: 2,
+            memory_mib: 2048,
+        };
+        assert_keys(&serde_json::to_value(&hw).unwrap(), &["cpus", "memory_mib"]);
+
+        // DiskSpec (↔ DiskDto). `backing` is always emitted (Option, no skip).
+        let disk = DiskSpec {
+            path: "disk.qcow2".into(),
+            size_gib: 8,
+            backing: None,
+        };
+        assert_keys(
+            &serde_json::to_value(&disk).unwrap(),
+            &["path", "size_gib", "backing"],
+        );
+
+        // PortForward.
+        let pf = PortForward {
+            host: 2222,
+            guest: 22,
+            udp: false,
+        };
+        assert_keys(
+            &serde_json::to_value(&pf).unwrap(),
+            &["host", "guest", "udp"],
+        );
+
+        // NetworkConfig (↔ NetworkDto) — embeds the kebab-case mode enum.
+        let net = NetworkConfig {
+            mode: NetworkMode::HostOnly,
+            mac: None,
+            port_forwards: vec![pf],
+        };
+        let net_v = serde_json::to_value(&net).unwrap();
+        assert_keys(&net_v, &["mode", "mac", "port_forwards"]);
+        assert_eq!(net_v["mode"], "host-only");
+
+        // VmSummary — carries the lowercase state + accelerator enums.
+        let summary = VmSummary {
+            id: Uuid::nil(),
+            name: "x".into(),
+            state: VmState::Running,
+            accelerator: Accelerator::Hvf,
+            emulated: false,
+        };
+        let sum_v = serde_json::to_value(&summary).unwrap();
+        assert_keys(&sum_v, &["id", "name", "state", "accelerator", "emulated"]);
+        assert_eq!(sum_v["state"], "running");
+        assert_eq!(sum_v["accelerator"], "hvf");
+    }
+
+    /// VmSummary serializes with exactly its snake_case field names.
+    #[test]
+    fn vm_summary_json_fields() {
+        let s = VmSummary {
+            id: Uuid::nil(),
+            name: "x".into(),
+            state: VmState::Defined,
+            accelerator: Accelerator::Tcg,
+            emulated: false,
+        };
+        let v: serde_json::Value = serde_json::to_value(&s).unwrap();
+        let obj = v.as_object().unwrap();
+        for key in ["id", "name", "state", "accelerator", "emulated"] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+        assert_eq!(obj.len(), 5);
+    }
 }

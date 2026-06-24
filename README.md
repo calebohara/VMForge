@@ -43,6 +43,12 @@ cargo check --workspace
   over a Rust VNC↔WebSocket bridge → power off. Verified by a gated integration
   test that boots Alpine aarch64 headless and drives it over QMP, plus the
   console RFB handshake through the bridge.
+- **Phase 2 (library + persistence) — functional & verified.** VM library
+  dashboard, New-VM wizard, hardware editor (edit while stopped), and
+  `vmforge.toml` persistence (directory-scanned library, atomic writes,
+  slug-addressed dirs). Live status via `list_vms` polling with a natural-exit
+  reaper. Adversarially reviewed; 9 confirmed findings fixed (2 critical IPC
+  arg-key bugs, a reaper race, path-traversal + `-drive` injection hardening).
 
 Run the app with `npm run tauri dev`, then Browse to an ISO and **Create &
 start**. See [`CLAUDE.md`](CLAUDE.md) for architecture, conventions, pinned

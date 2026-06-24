@@ -1,0 +1,113 @@
+// Pure display formatters. No React, no IPC — safe to unit-test directly.
+import type { Accelerator, VmState } from "@/lib/ipc";
+
+/** Format a MiB amount as a human GiB string (e.g. 2048 -> "2 GiB"). */
+export function formatMemory(memoryMib: number): string {
+  if (!Number.isFinite(memoryMib) || memoryMib <= 0) return "0 MiB";
+  if (memoryMib < 1024) return `${memoryMib} MiB`;
+  const gib = memoryMib / 1024;
+  const rounded = Math.round(gib * 100) / 100;
+  return `${rounded} GiB`;
+}
+
+/** Convert MiB to GiB as a number (no unit). */
+export function mibToGib(memoryMib: number): number {
+  return Math.round((memoryMib / 1024) * 100) / 100;
+}
+
+/** Convert GiB to MiB as a whole number. */
+export function gibToMib(gib: number): number {
+  return Math.round(gib * 1024);
+}
+
+/** Human label for a lifecycle state. */
+export function stateLabel(state: VmState): string {
+  switch (state) {
+    case "defined":
+      return "Defined";
+    case "starting":
+      return "Starting";
+    case "running":
+      return "Running";
+    case "paused":
+      return "Paused";
+    case "stopping":
+      return "Stopping";
+    case "stopped":
+      return "Stopped";
+    case "error":
+      return "Error";
+    default:
+      return state;
+  }
+}
+
+export type StateTone = "running" | "paused" | "idle" | "transitioning" | "error";
+
+/** Semantic tone for a lifecycle state (drives badge colors). */
+export function stateTone(state: VmState): StateTone {
+  switch (state) {
+    case "running":
+      return "running";
+    case "paused":
+      return "paused";
+    case "defined":
+    case "stopped":
+      return "idle";
+    case "starting":
+    case "stopping":
+      return "transitioning";
+    case "error":
+      return "error";
+    default:
+      return "idle";
+  }
+}
+
+/** Whether a state represents a live (process-backed) VM. */
+export function isLive(state: VmState): boolean {
+  return (
+    state === "starting" ||
+    state === "running" ||
+    state === "paused" ||
+    state === "stopping"
+  );
+}
+
+/** Whether a state is mid-transition (actions should show a spinner). */
+export function isTransitioning(state: VmState): boolean {
+  return state === "starting" || state === "stopping";
+}
+
+/** Display label for an accelerator. */
+export function accelLabel(accel: Accelerator): string {
+  switch (accel) {
+    case "hvf":
+      return "HVF";
+    case "whpx":
+      return "WHPX";
+    case "kvm":
+      return "KVM";
+    case "tcg":
+      return "TCG";
+    default:
+      return String(accel).toUpperCase();
+  }
+}
+
+/** True for hardware-accelerated backends (not TCG). */
+export function isHardwareAccel(accel: Accelerator): boolean {
+  return accel !== "tcg";
+}
+
+/** Format a vCPU count (e.g. "2 vCPU", "4 vCPUs"). */
+export function formatCpus(cpus: number): string {
+  return cpus === 1 ? "1 vCPU" : `${cpus} vCPUs`;
+}
+
+/** Pull a friendly filename off a full path. */
+export function basename(path: string): string {
+  if (!path) return "";
+  const parts = path.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}

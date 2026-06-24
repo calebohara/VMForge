@@ -13,9 +13,17 @@ pub fn library_dir() -> Result<PathBuf> {
     Ok(base.home_dir().join("VMForge"))
 }
 
+/// Filename of a VM's persisted configuration within its directory.
+pub const CONFIG_FILENAME: &str = "vmforge.toml";
+
 /// Directory for a single VM within a library root.
 pub fn vm_dir(library: &Path, name: &str) -> PathBuf {
     library.join(name)
+}
+
+/// Path to a VM's `vmforge.toml`, addressed by its directory slug.
+pub fn vm_config_path(library: &Path, slug: &str) -> PathBuf {
+    vm_dir(library, slug).join(CONFIG_FILENAME)
 }
 
 /// Short runtime directory for control sockets.

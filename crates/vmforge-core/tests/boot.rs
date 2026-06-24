@@ -1,9 +1,12 @@
-//! Integration: boot a real guest headless and control it over QMP.
+//! Integration: persist a VM, reload the library in a fresh engine, then boot
+//! the real guest headless and control it over QMP.
 //!
 //! GATED — runs only when `VMFORGE_ISO` points at a bootable ISO, so the
 //! default `cargo test` suite stays fully offline (no QEMU/VM in CI). This is
-//! the Phase 1 engine proof-of-life: spawn QEMU, complete the QMP handshake,
-//! observe `running`, pause→`paused`, resume→`running`, then force-kill.
+//! the Phase 1+2 engine proof-of-life: `create_vm` (persist, no launch) → a new
+//! `QemuHypervisor` on the same library root → `list_all` shows the VM
+//! `Defined` → `start` it by id → observe `running`, pause→`paused`,
+//! resume→`running`, then force-kill.
 //!
 //! Run on this host:
 //!   VMFORGE_ISO=.vmforge-data/isos/alpine-virt-3.24.1-aarch64.iso \
@@ -25,12 +28,16 @@ async fn boots_real_guest_and_controls_via_qmp() {
     };
 
     let tmp = std::env::temp_dir().join(format!("vmforge-it-{}", Uuid::new_v4()));
-    let hv = QemuHypervisor::with_library_dir(tmp.clone()).expect("build hypervisor");
-    eprintln!("accelerator: {:?}", hv.accelerator());
 
-    let config = VmConfig {
+    // --- Persist the VM (no launch) through one engine instance. ---
+    let creator = QemuHypervisor::with_library_dir(tmp.clone()).expect("build hypervisor");
+    eprintln!("accelerator: {:?}", creator.accelerator());
+
+    let draft = VmConfig {
         id: Uuid::new_v4(),
         name: "it-alpine".into(),
+        schema_version: 1,
+        dir_slug: String::new(), // assigned by the library on create
         hardware: Hardware {
             cpus: 2,
             memory_mib: 1024,
@@ -43,9 +50,28 @@ async fn boots_real_guest_and_controls_via_qmp() {
         network: NetworkConfig::default(),
         display: Default::default(),
         iso: Some(iso),
+        metadata: Default::default(),
     };
-    let id = config.id.to_string();
+    let created = creator.create_vm(draft).await.expect("persist VM");
+    let id = created.id.to_string();
+    assert_eq!(created.dir_slug, "it-alpine", "slug derived from name");
+    drop(creator);
 
+    // --- Fresh engine on the SAME root reloads the VM from disk. ---
+    let hv = QemuHypervisor::with_library_dir(tmp.clone()).expect("reopen hypervisor");
+    let listed = hv.list_all().await.expect("list_all");
+    let summary = listed
+        .iter()
+        .find(|s| s.id == created.id)
+        .expect("created VM appears in the library");
+    assert_eq!(
+        summary.state,
+        VmState::Defined,
+        "persisted but not launched → Defined"
+    );
+
+    // --- Start it by id (load config from the library, then launch). ---
+    let config = hv.get_config(&id).await.expect("load persisted config");
     hv.start(&config).await.expect("start VM");
 
     // Reaches running (QEMU starts the CPU unless -S is passed).
@@ -54,6 +80,18 @@ async fn boots_real_guest_and_controls_via_qmp() {
     assert!(
         matches!(state, VmState::Running | VmState::Starting),
         "unexpected post-start state: {state:?}"
+    );
+
+    // list_all now overlays the running state for this VM.
+    let listed = hv.list_all().await.expect("list_all after start");
+    let live = listed
+        .iter()
+        .find(|s| s.id == created.id)
+        .expect("VM still listed");
+    assert!(
+        matches!(live.state, VmState::Running | VmState::Starting),
+        "list_all should overlay running state, got {:?}",
+        live.state
     );
 
     // VNC display was allocated in range.
@@ -106,5 +144,5 @@ async fn boots_real_guest_and_controls_via_qmp() {
     hv.kill(&id).await.expect("kill");
 
     let _ = std::fs::remove_dir_all(&tmp);
-    eprintln!("OK: engine boot + QMP control verified");
+    eprintln!("OK: persistence + engine boot + QMP control verified");
 }

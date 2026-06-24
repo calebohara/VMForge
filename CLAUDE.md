@@ -145,8 +145,10 @@ VMForge/
   qcow2, HVF/KVM accel) → interactive embedded VNC console → clean power-off
   via QMP. One VM, near-hardcoded config OK. **Do not proceed until this works
   on the host.**
-- **Phase 2 — Library + persistence.** Multiple VMs, New-VM wizard,
-  `vmforge.toml` + library index, hardware editor, live status via QMP.
+- **Phase 2 — Library + persistence.** ✅ Multiple VMs, New-VM wizard,
+  `vmforge.toml` + directory-scanned library, hardware editor (edit while
+  stopped), live status via `list_vms` polling (events deferred to Phase 3).
+  See [`docs/phase2-spec.md`](docs/phase2-spec.md).
 - **Phase 3 — Snapshots & clones.** Snapshot tree UI, live + offline
   snapshots, restore, full/linked clones.
 - **Phase 4 — Networking modes.** Bridged + host-only (elevated-permissions
