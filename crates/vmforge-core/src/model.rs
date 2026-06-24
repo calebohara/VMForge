@@ -67,21 +67,16 @@ pub struct DiskSpec {
     pub backing: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum NetworkMode {
     /// User-mode NAT (`-netdev user`). Zero privileges. MVP default.
+    #[default]
     User,
     /// Bridged to a host interface. Needs elevated permissions.
     Bridged,
     /// Host-only network. Needs elevated permissions.
     HostOnly,
-}
-
-impl Default for NetworkMode {
-    fn default() -> Self {
-        Self::User
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

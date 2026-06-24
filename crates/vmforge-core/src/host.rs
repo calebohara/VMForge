@@ -150,13 +150,17 @@ pub fn probe() -> Result<HostCapabilities> {
     })
 }
 
-fn native_system_binary(arch: &str) -> String {
+/// QEMU system-emulator binary name for a guest/host arch.
+pub fn system_binary(arch: &str) -> &'static str {
     match arch {
         "aarch64" => "qemu-system-aarch64",
         "x86_64" => "qemu-system-x86_64",
         _ => "qemu-system-x86_64",
     }
-    .to_string()
+}
+
+fn native_system_binary(arch: &str) -> String {
+    system_binary(arch).to_string()
 }
 
 fn binary_version(bin: &str) -> Option<String> {

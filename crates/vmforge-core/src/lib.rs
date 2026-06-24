@@ -25,5 +25,10 @@ pub mod error;
 pub mod host;
 pub mod hypervisor;
 pub mod model;
+pub mod paths;
+pub mod qemu;
+pub mod storage;
 
 pub use error::{Error, Result};
+pub use hypervisor::Hypervisor;
+pub use qemu::QemuHypervisor;
