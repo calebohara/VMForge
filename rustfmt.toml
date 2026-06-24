@@ -1,0 +1,2 @@
+# Rust formatting — stable defaults. Run `cargo fmt --all`.
+edition = "2021"
