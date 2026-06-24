@@ -8,6 +8,10 @@
 
 mod commands;
 
+use commands::AppState;
+use std::sync::Arc;
+use vmforge_core::QemuHypervisor;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -17,9 +21,22 @@ pub fn run() {
         )
         .init();
 
+    let hv = Arc::new(QemuHypervisor::new().expect("failed to initialize QEMU hypervisor"));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![commands::probe_host])
+        .plugin(tauri_plugin_dialog::init())
+        .manage(AppState { hv })
+        .invoke_handler(tauri::generate_handler![
+            commands::probe_host,
+            commands::create_and_start_vm,
+            commands::open_console,
+            commands::vm_state,
+            commands::power_off,
+            commands::force_off,
+            commands::pause_vm,
+            commands::resume_vm,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running VMForge");
 }

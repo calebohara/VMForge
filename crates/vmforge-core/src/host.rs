@@ -112,7 +112,10 @@ pub fn probe() -> Result<HostCapabilities> {
 
     // Probe accelerators against the binary that matches the host arch.
     let native = native_system_binary(&arch);
-    let available_accelerators = if system_binaries.iter().any(|b| b.name == native && b.present) {
+    let available_accelerators = if system_binaries
+        .iter()
+        .any(|b| b.name == native && b.present)
+    {
         query_accelerators(&native)
     } else {
         Vec::new()
@@ -122,7 +125,8 @@ pub fn probe() -> Result<HostCapabilities> {
     let hardware_accelerated = preferred.is_hardware();
 
     if !qemu_img.present {
-        warnings.push("qemu-img not found — disk operations unavailable. Install QEMU.".to_string());
+        warnings
+            .push("qemu-img not found — disk operations unavailable. Install QEMU.".to_string());
     }
     if system_binaries.iter().all(|b| !b.present) {
         warnings

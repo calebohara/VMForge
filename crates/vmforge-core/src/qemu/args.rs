@@ -56,7 +56,11 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
         }
         _ => {
             flag("-machine", "q35".to_string());
-            let cpu = if l.accel.is_hardware() { "host" } else { "qemu64" };
+            let cpu = if l.accel.is_hardware() {
+                "host"
+            } else {
+                "qemu64"
+            };
             flag("-cpu", cpu.to_string());
         }
     }
@@ -100,19 +104,24 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
     };
     flag("-device", nic);
 
+    // Graphics + input so the VNC console renders output and accepts clicks.
+    // aarch64 `virt` has no default display adapter; x86 q35 has built-in VGA.
+    if l.guest_arch == "aarch64" {
+        flag("-device", "virtio-gpu-pci".to_string());
+    }
+    flag("-device", "qemu-xhci,id=usb".to_string());
+    flag("-device", "usb-kbd".to_string());
+    flag("-device", "usb-tablet".to_string());
+
     // Display: built-in VNC server on loopback (noVNC bridge connects here).
     flag("-vnc", format!("127.0.0.1:{}", l.vnc_display));
 
     // QMP control channel.
     match &l.qmp {
-        QmpEndpoint::UnixSocket(p) => flag(
-            "-qmp",
-            format!("unix:{},server=on,wait=off", p.display()),
-        ),
-        QmpEndpoint::Tcp(port) => flag(
-            "-qmp",
-            format!("tcp:127.0.0.1:{port},server=on,wait=off"),
-        ),
+        QmpEndpoint::UnixSocket(p) => {
+            flag("-qmp", format!("unix:{},server=on,wait=off", p.display()))
+        }
+        QmpEndpoint::Tcp(port) => flag("-qmp", format!("tcp:127.0.0.1:{port},server=on,wait=off")),
     }
 
     a

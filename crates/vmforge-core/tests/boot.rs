@@ -9,7 +9,9 @@
 //!   VMFORGE_ISO=.vmforge-data/isos/alpine-virt-3.24.1-aarch64.iso \
 //!     cargo test -p vmforge-core --test boot -- --nocapture
 
+use futures_util::StreamExt;
 use std::time::Duration;
+use tokio_tungstenite::connect_async;
 use uuid::Uuid;
 use vmforge_core::hypervisor::Hypervisor;
 use vmforge_core::model::{DiskSpec, Hardware, NetworkConfig, VmConfig, VmState};
@@ -57,12 +59,40 @@ async fn boots_real_guest_and_controls_via_qmp() {
     // VNC display was allocated in range.
     let port = hv.vnc_port(&id).await.expect("vnc port");
     eprintln!("VNC host port: {port}");
-    assert!((5901..=5963).contains(&port), "vnc port out of range: {port}");
+    assert!(
+        (5901..=5963).contains(&port),
+        "vnc port out of range: {port}"
+    );
+
+    // Console path: the bridge forwards the real QEMU VNC server's RFB
+    // protocol greeting to a WebSocket client (proves graphics device + bridge).
+    let ws_port = hv.open_console(&id).await.expect("open console");
+    let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{ws_port}"))
+        .await
+        .expect("ws connect");
+    let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("ws greeting timed out")
+        .expect("ws closed")
+        .expect("ws error");
+    let bytes = frame.into_data();
+    assert!(
+        bytes.starts_with(b"RFB 00"),
+        "expected RFB greeting from QEMU VNC, got {:?}",
+        &bytes[..bytes.len().min(16)]
+    );
+    eprintln!(
+        "console RFB greeting: {}",
+        String::from_utf8_lossy(&bytes).trim()
+    );
 
     // pause -> paused
     hv.pause(&id).await.expect("pause");
     tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(hv.state(&id).await.expect("state after pause"), VmState::Paused);
+    assert_eq!(
+        hv.state(&id).await.expect("state after pause"),
+        VmState::Paused
+    );
 
     // resume -> running
     hv.resume(&id).await.expect("resume");

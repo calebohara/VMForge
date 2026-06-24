@@ -36,6 +36,7 @@ struct RunningVm {
     qmp_socket: Option<PathBuf>,
     process: Mutex<QemuProcess>,
     qmp: Mutex<QmpClient>,
+    bridge: Mutex<Option<crate::console::VncBridge>>,
 }
 
 pub struct QemuHypervisor {
@@ -66,6 +67,20 @@ impl QemuHypervisor {
     /// Host VNC port for a running VM (for the noVNC bridge / IPC).
     pub async fn vnc_port(&self, id: &str) -> Result<u16> {
         Ok(self.get(id).await?.vnc_port)
+    }
+
+    /// Start (or reuse) the VNC↔WebSocket bridge for a VM and return the
+    /// loopback WebSocket port noVNC should connect to.
+    pub async fn open_console(&self, id: &str) -> Result<u16> {
+        let vm = self.get(id).await?;
+        let mut bridge = vm.bridge.lock().await;
+        if let Some(b) = bridge.as_ref() {
+            return Ok(b.ws_port);
+        }
+        let b = crate::console::VncBridge::start(vm.vnc_port).await?;
+        let port = b.ws_port;
+        *bridge = Some(b);
+        Ok(port)
     }
 
     /// Summaries of currently-running VMs.
@@ -202,6 +217,7 @@ impl Hypervisor for QemuHypervisor {
                 qmp_socket,
                 process: Mutex::new(proc),
                 qmp: Mutex::new(qmp),
+                bridge: Mutex::new(None),
             }),
         );
         Ok(())
@@ -278,7 +294,15 @@ async fn connect_qmp(bind: &QmpBind, timeout: Duration) -> Result<QmpClient> {
 async fn tail_log(path: &std::path::Path) -> String {
     match tokio::fs::read_to_string(path).await {
         Ok(s) if !s.trim().is_empty() => {
-            let tail: String = s.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+            let tail: String = s
+                .lines()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
             format!("\n--- qemu.log (tail) ---\n{tail}")
         }
         _ => String::new(),

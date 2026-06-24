@@ -36,10 +36,17 @@ cargo check --workspace
 
 ## Status
 
-Phase 0 (foundations) complete: host probe, workspace scaffold, host-capability
-IPC + first-run UI. Phase 1 (vertical slice: ISO → launch → console →
-power-off) is next. See [`CLAUDE.md`](CLAUDE.md) for architecture, conventions,
-pinned versions, the phased roadmap, and the agent team.
+- **Phase 0 (foundations) — complete.** Host probe, workspace scaffold,
+  host-capability IPC + first-run UI.
+- **Phase 1 (vertical slice) — functional & verified.** ISO → launch (HVF) →
+  QMP lifecycle (running/pause/resume/shutdown/kill) → embedded noVNC console
+  over a Rust VNC↔WebSocket bridge → power off. Verified by a gated integration
+  test that boots Alpine aarch64 headless and drives it over QMP, plus the
+  console RFB handshake through the bridge.
+
+Run the app with `npm run tauri dev`, then Browse to an ISO and **Create &
+start**. See [`CLAUDE.md`](CLAUDE.md) for architecture, conventions, pinned
+versions, the phased roadmap, and the agent team.
 
 ## License
 

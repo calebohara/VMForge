@@ -21,6 +21,7 @@
 //! - `storage`    qemu-img wrapper — storage-engineer (Phase 1/3)
 //! - `network`    netdev model — network-engineer (Phase 1/4)
 
+pub mod console;
 pub mod error;
 pub mod host;
 pub mod hypervisor;
