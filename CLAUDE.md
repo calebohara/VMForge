@@ -158,8 +158,12 @@ VMForge/
   abstraction + capability detection + "needs elevated permissions" UX
   (privileged bring-up deferred — rejected at launch, never silent NAT
   fallback). See [`docs/phase4-spec.md`](docs/phase4-spec.md).
-- **Phase 5 — Workstation niceties.** SPICE (clipboard, dynamic res, USB
-  redirect), shared folders, drag-and-drop, snapshot-at-suspend.
+- **Phase 5 — Workstation niceties.** ✅ (verifiable subset) virtio-9p **shared
+  folders** (host dir → guest mount) and **Suspend/Resume** (live snapshot
+  save+restore — lands Phase 3's deferred live restore; accelerator-gated:
+  refused on aarch64+HVF where QMP `snapshot-load` crashes, works under TCG).
+  SPICE / USB redirect / drag-and-drop deferred (not feasible in the webview/
+  sandbox). See [`docs/phase5-spec.md`](docs/phase5-spec.md).
 - **Phase 6 — Distribution.** Signed packaged builds, first-run QEMU dependency
   handling, auto-update.
 

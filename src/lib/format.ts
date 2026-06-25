@@ -1,5 +1,5 @@
 // Pure display formatters. No React, no IPC — safe to unit-test directly.
-import type { Accelerator, VmState } from "@/lib/ipc";
+import type { Accelerator, VmListItem, VmState } from "@/lib/ipc";
 
 /** Format a MiB amount as a human GiB string (e.g. 2048 -> "2 GiB"). */
 export function formatMemory(memoryMib: number): string {
@@ -77,6 +77,15 @@ export function isLive(state: VmState): boolean {
 /** Whether a state is mid-transition (actions should show a spinner). */
 export function isTransitioning(state: VmState): boolean {
   return state === "starting" || state === "stopping";
+}
+
+/**
+ * Whether a VM is suspended (Phase 5): it reports as `stopped` on the wire but
+ * carries a captured live snapshot. Suspended VMs offer Resume / Discard rather
+ * than a plain Start. Does not change the lifecycle state or its tone.
+ */
+export function isSuspended(vm: Pick<VmListItem, "state" | "suspended">): boolean {
+  return vm.state === "stopped" && vm.suspended === true;
 }
 
 /** Display label for an accelerator. */

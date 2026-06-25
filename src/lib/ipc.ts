@@ -71,6 +71,18 @@ export interface NetworkConfig {
   port_forwards: PortForward[];
 }
 
+/**
+ * A virtio-9p shared folder (Phase 5). Mirrors `SharedFolderDto` in
+ * `src-tauri/src/commands.rs` — snake_case wire keys.
+ */
+export interface SharedFolder {
+  /** Absolute host directory; must exist (validated server-side). */
+  host_path: string;
+  /** 9p `mount_tag` used by the guest to mount this folder. */
+  mount_tag: string;
+  read_only: boolean;
+}
+
 export interface VmConfig {
   id: string;
   name: string;
@@ -78,6 +90,13 @@ export interface VmConfig {
   disks: Disk[];
   network: NetworkConfig;
   iso: string | null;
+  /** virtio-9p shared folders (Phase 5). Optional for serde back-compat. */
+  shared_folders?: SharedFolder[];
+  /**
+   * Derived suspend flag (Phase 5): true when the VM has a captured live
+   * snapshot. A suspended VM reports `state === "stopped"` on the wire.
+   */
+  suspended?: boolean;
 }
 
 export interface VmListItem {
@@ -89,6 +108,11 @@ export interface VmListItem {
   cpus: number;
   memory_mib: number;
   iso: string | null;
+  /**
+   * Derived suspend flag (Phase 5). When true with `state === "stopped"` the
+   * VM is suspended (resume or discard), not plainly stopped.
+   */
+  suspended?: boolean;
 }
 
 export interface CreateVmRequest {
@@ -104,6 +128,8 @@ export interface UpdateVmRequest {
   hardware: Hardware;
   network?: NetworkConfig | null;
   iso?: string | null;
+  /** virtio-9p shared folders (Phase 5). Serde-optional for back-compat. */
+  shared_folders?: SharedFolder[];
 }
 
 // ---- Phase 3 snapshot / clone types (mirror SnapshotDto, snake_case) ----
@@ -148,6 +174,19 @@ export const powerOff = (id: string) => invoke<void>("power_off", { id });
 export const forceOff = (id: string) => invoke<void>("force_off", { id });
 export const pauseVm = (id: string) => invoke<void>("pause_vm", { id });
 export const resumeVm = (id: string) => invoke<void>("resume_vm", { id });
+
+// ---- Phase 5 suspend/restore wrappers (distinct from pause/resume = QMP cont) ----
+
+/** Suspend a running VM: capture live snapshot then terminate the process. */
+export const suspendVm = (id: string) => invoke<void>("suspend_vm", { id });
+/** Restore a suspended VM: relaunch with `-S`, `snapshot-load`, then `cont`. */
+export const restoreVm = (id: string) => invoke<void>("restore_vm", { id });
+/**
+ * Discard a VM's captured suspend state, returning it to plain stopped (the
+ * escape hatch when a suspended VM should not be resumed).
+ */
+export const discardSuspend = (id: string) =>
+  invoke<void>("discard_suspend", { id });
 
 // ---- Phase 2 library/lifecycle wrappers (snake_case arg keys) ----
 

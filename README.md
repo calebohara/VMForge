@@ -66,6 +66,17 @@ cargo check --workspace
   forwarded host port). Adversarially reviewed; 5 confirmed findings fixed
   (a high-severity editor-lockout for privileged-mode VMs, MAC arg-injection
   hardening, a port-cap validity inversion, TS↔Rust type-sync).
+- **Phase 5 (workstation niceties, verifiable subset) — functional & verified.**
+  virtio-9p **shared folders** (host dir → guest mount, localhost-safe
+  validation) and **Suspend/Resume** (live snapshot save + `-S`/`snapshot-load`
+  restore — this also lands Phase 3's deferred live restore). Suspend/Resume is
+  **accelerator-gated**: refused on Apple-Silicon **HVF** (where QEMU's
+  `snapshot-load` crashes — a verified ARM hardware-accel limitation), working
+  under **TCG**. Verified by gated real-host tests (9p device accepted by QEMU;
+  TCG suspend→resume round-trip). SPICE / USB redirect / drag-and-drop deferred
+  (not feasible in the Tauri webview/sandbox). Adversarially reviewed; 5
+  confirmed findings fixed (a missing `discard_suspend` IPC command, a
+  resume-time vmstate leak, console nav-on-failure).
 
 Run the app with `npm run tauri dev`, then Browse to an ISO and **Create &
 start**. See [`CLAUDE.md`](CLAUDE.md) for architecture, conventions, pinned

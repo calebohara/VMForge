@@ -36,6 +36,19 @@ pub trait Hypervisor: Send + Sync {
     /// Resume execution (QMP `cont`).
     async fn resume(&self, id: &str) -> Result<()>;
 
+    /// Suspend the VM: capture its live RAM/device state to a qcow2 vmstate
+    /// snapshot, persist the tag in `metadata.suspended_snapshot`, then
+    /// terminate the process. A suspended VM is `Stopped` on the wire; resume it
+    /// with [`Hypervisor::restore_suspended`]. Accelerator-gated: refused up
+    /// front on `aarch64 + HVF` (QMP `snapshot-load` crashes under HVF), so an
+    /// unresumable vmstate is never captured.
+    async fn suspend(&self, id: &str) -> Result<()>;
+
+    /// Resume a suspended VM: relaunch paused (`-S`), `snapshot-load` the stored
+    /// vmstate, `cont`, then clear `metadata.suspended_snapshot`. Distinct from
+    /// [`Hypervisor::resume`] (a plain QMP `cont` on a paused VM).
+    async fn restore_suspended(&self, id: &str) -> Result<()>;
+
     /// Current lifecycle state (QMP `query-status`).
     async fn state(&self, id: &str) -> Result<VmState>;
 }

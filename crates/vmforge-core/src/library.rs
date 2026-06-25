@@ -184,6 +184,13 @@ impl Library {
                     // clone/convert/launch. See is_safe_disk_filename/backing.
                     tracing::warn!(target: "vmforge_core::library", path = %config_path.display(), "skipping config with unsafe disk path/backing");
                 }
+                Ok(c) if !config_shares_safe(&c) => {
+                    // Same fail-closed chokepoint for 9p shared folders: a
+                    // hand-edited shared_folders[] with an unsafe tag/path or a
+                    // duplicate tag is dropped so it can never reach launch. See
+                    // is_safe_mount_tag/is_safe_share_path/config_shares_safe.
+                    tracing::warn!(target: "vmforge_core::library", path = %config_path.display(), "skipping config with unsafe shared folder");
+                }
                 Ok(c) => out.push(c),
                 Err(e) => {
                     tracing::warn!(target: "vmforge_core::library", path = %config_path.display(), error = %e, "skipping malformed vmforge.toml");
@@ -301,8 +308,10 @@ impl Library {
                 updated_at: Some(now),
                 notes: src.metadata.notes.clone(),
                 os_hint: src.metadata.os_hint.clone(),
+                suspended_snapshot: None, // a clone never carries suspend state
             },
             snapshots: Vec::new(), // snapshots NOT carried (A4)
+            shared_folders: src.shared_folders.clone(),
         };
 
         // Config LAST: until this lands the dir is config-less and invisible.
@@ -360,8 +369,10 @@ impl Library {
                 updated_at: Some(now),
                 notes: src.metadata.notes.clone(),
                 os_hint: src.metadata.os_hint.clone(),
+                suspended_snapshot: None, // a clone never carries suspend state
             },
             snapshots: Vec::new(),
+            shared_folders: src.shared_folders.clone(),
         };
 
         write_config_atomic(&config_path, &clone).await?;
@@ -720,6 +731,59 @@ pub fn config_disks_safe(config: &VmConfig) -> bool {
         .all(|d| is_safe_disk_filename(&d.path) && d.backing.as_deref().is_none_or(is_safe_backing))
 }
 
+/// A 9p `mount_tag` is safe iff non-empty, ≤31 bytes, not `-`-leading (which a
+/// device option could misparse), and drawn from `[A-Za-z0-9._-]` — a
+/// comma-free charset, so it is NEVER comma-escaped at launch (decision A). Read
+/// verbatim from `vmforge.toml`, so guard it fail-closed.
+pub fn is_safe_mount_tag(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 31
+        && !t.starts_with('-')
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// A shared-folder `host_path` is safe iff non-empty, not `-`-leading (option
+/// injection), and absolute. Commas are allowed — `esc` doubles them inside the
+/// `-fsdev path=` option value (decision A).
+pub fn is_safe_share_path(p: &str) -> bool {
+    !p.is_empty() && !p.starts_with('-') && std::path::Path::new(p).is_absolute()
+}
+
+/// True iff every shared folder in `config` is lexically safe AND mount tags are
+/// unique. The `load_all` chokepoint (fail-closed, like [`config_disks_safe`]):
+/// a hand-edited share with an unsafe tag/path or a duplicate tag is dropped at
+/// load so it can never reach launch.
+pub fn config_shares_safe(config: &VmConfig) -> bool {
+    let mut tags = HashSet::new();
+    config.shared_folders.iter().all(|sf| {
+        is_safe_mount_tag(&sf.mount_tag)
+            && is_safe_share_path(&sf.host_path)
+            && tags.insert(sf.mount_tag.as_str())
+    })
+}
+
+/// Validate a config's shared folders BEFORE spawn: every folder must be
+/// lexically safe with unique tags ([`config_shares_safe`]), and each
+/// `host_path` must be an existing directory. Any failure maps to
+/// [`Error::Config`] (never a silent skip — launch is refused).
+pub fn validate_shared_folders(config: &VmConfig) -> Result<()> {
+    if !config_shares_safe(config) {
+        return Err(Error::Config(
+            "shared folders have an invalid mount tag/path or duplicate tags".into(),
+        ));
+    }
+    for sf in &config.shared_folders {
+        if !std::path::Path::new(&sf.host_path).is_dir() {
+            return Err(Error::Config(format!(
+                "shared folder host path is not an existing directory: {}",
+                sf.host_path
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// True iff the only differences between two configs are runtime-safe to apply
 /// while the VM is live — i.e. `name` and/or `metadata`. Any change to
 /// hardware, disks, network, display, iso, id, slug, or schema makes it unsafe.
@@ -732,6 +796,7 @@ pub fn is_runtime_safe_edit(old: &VmConfig, new: &VmConfig) -> bool {
         && disks_eq(&old.disks, &new.disks)
         && network_eq(&old.network, &new.network)
         && old.iso == new.iso
+        && old.shared_folders == new.shared_folders
 }
 
 fn disks_eq(a: &[crate::model::DiskSpec], b: &[crate::model::DiskSpec]) -> bool {
@@ -789,8 +854,10 @@ mod tests {
                 updated_at: Some("2026-06-24T17:40:00Z".into()),
                 notes: "hello".into(),
                 os_hint: Some("alpine".into()),
+                suspended_snapshot: None,
             },
             snapshots: Vec::new(),
+            shared_folders: Vec::new(),
         }
     }
 
@@ -1286,6 +1353,120 @@ mod tests {
             lib.load_config(&id).await.unwrap_err(),
             Error::VmNotFound(_)
         ));
+    }
+
+    // ====================================================================
+    // Phase 5 — 9p shared-folder validators
+    // ====================================================================
+
+    use crate::model::SharedFolder;
+
+    #[test]
+    fn is_safe_mount_tag_table() {
+        // Accepted.
+        assert!(is_safe_mount_tag("share"));
+        assert!(is_safe_mount_tag("My_Share-1.0"));
+        assert!(is_safe_mount_tag("a"));
+        assert!(is_safe_mount_tag(&"x".repeat(31))); // exactly 31 bytes
+                                                     // Rejected.
+        assert!(!is_safe_mount_tag("")); // empty
+        assert!(!is_safe_mount_tag(&"x".repeat(32))); // 32 bytes (>31)
+        assert!(!is_safe_mount_tag("-leading")); // leading dash
+        assert!(!is_safe_mount_tag("has space")); // space not in charset
+        assert!(!is_safe_mount_tag("has,comma")); // comma would need escaping
+        assert!(!is_safe_mount_tag("slash/tag")); // separator
+        assert!(!is_safe_mount_tag("日本語")); // non-ascii
+    }
+
+    #[test]
+    fn is_safe_share_path_table() {
+        // Accepted: absolute, comma allowed (esc doubles it).
+        assert!(is_safe_share_path("/home/user/share"));
+        assert!(is_safe_share_path("/has,comma"));
+        // Rejected.
+        assert!(!is_safe_share_path("")); // empty
+        assert!(!is_safe_share_path("relative/path")); // not absolute
+        assert!(!is_safe_share_path("./rel")); // not absolute
+        assert!(!is_safe_share_path("-/leading-dash")); // leading dash (injection)
+    }
+
+    #[test]
+    fn config_shares_safe_rejects_duplicate_tags() {
+        let mut c = sample_config();
+        c.shared_folders = vec![
+            SharedFolder {
+                host_path: "/a".into(),
+                mount_tag: "dup".into(),
+                read_only: false,
+            },
+            SharedFolder {
+                host_path: "/b".into(),
+                mount_tag: "dup".into(),
+                read_only: false,
+            },
+        ];
+        assert!(
+            !config_shares_safe(&c),
+            "duplicate mount tags must be unsafe"
+        );
+
+        // Distinct tags → safe.
+        c.shared_folders[1].mount_tag = "other".into();
+        assert!(config_shares_safe(&c));
+
+        // An unsafe tag also fails.
+        c.shared_folders[1].mount_tag = "bad tag".into();
+        assert!(!config_shares_safe(&c));
+
+        // An unsafe (relative) host path also fails.
+        c.shared_folders[1].mount_tag = "other".into();
+        c.shared_folders[1].host_path = "relative".into();
+        assert!(!config_shares_safe(&c));
+    }
+
+    #[tokio::test]
+    async fn load_all_skips_unsafe_share() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = Library::new(tmp.path().to_path_buf());
+        let dir = tmp.path().join("evil-share");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let id = Uuid::new_v4();
+        // Valid slug + disk, but a shared folder with a duplicate mount tag.
+        let toml = format!(
+            "id = \"{id}\"\nname = \"Evil Share\"\ndir_slug = \"evil-share\"\n\n\
+             [[shared_folders]]\nhost_path = \"/a\"\nmount_tag = \"dup\"\n\n\
+             [[shared_folders]]\nhost_path = \"/b\"\nmount_tag = \"dup\"\n"
+        );
+        tokio::fs::write(dir.join(paths::CONFIG_FILENAME), toml)
+            .await
+            .unwrap();
+
+        // Filtered at the load chokepoint → invisible and inoperable.
+        assert!(lib.list_vms().await.unwrap().is_empty());
+        assert!(matches!(
+            lib.load_config(&id).await.unwrap_err(),
+            Error::VmNotFound(_)
+        ));
+    }
+
+    #[test]
+    fn runtime_safe_edit_flips_on_shared_folders_change() {
+        let base = sample_config();
+        let mut sf_changed = base.clone();
+        sf_changed.shared_folders.push(SharedFolder {
+            host_path: "/new/share".into(),
+            mount_tag: "new".into(),
+            read_only: false,
+        });
+        assert!(
+            !is_runtime_safe_edit(&base, &sf_changed),
+            "adding a shared folder is not a runtime-safe edit"
+        );
+
+        // Identical shared folders (with name/notes change) stays safe.
+        let mut name_only = base.clone();
+        name_only.name = "Renamed".into();
+        assert!(is_runtime_safe_edit(&base, &name_only));
     }
 
     // ====================================================================

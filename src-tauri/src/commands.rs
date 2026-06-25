@@ -13,7 +13,8 @@ use tauri::State;
 use uuid::Uuid;
 use vmforge_core::host::{self, Accelerator, HostCapabilities, NetworkCapabilities};
 use vmforge_core::model::{
-    DiskSpec, Hardware, NetworkConfig, NetworkMode, PortForward, SnapshotNode, VmConfig, VmState,
+    DiskSpec, Hardware, NetworkConfig, NetworkMode, PortForward, SharedFolder, SnapshotNode,
+    VmConfig, VmState,
 };
 use vmforge_core::{Hypervisor, QemuHypervisor};
 
@@ -47,6 +48,14 @@ pub struct NetworkDto {
     pub port_forwards: Vec<PortForward>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SharedFolderDto {
+    pub host_path: String,
+    pub mount_tag: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateVmRequest {
     pub name: String,
@@ -66,6 +75,8 @@ pub struct UpdateVmRequest {
     pub network: Option<NetworkDto>,
     #[serde(default)]
     pub iso: Option<String>,
+    #[serde(default)]
+    pub shared_folders: Vec<SharedFolderDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,6 +87,8 @@ pub struct VmConfigDto {
     pub disks: Vec<DiskDto>,
     pub network: NetworkDto,
     pub iso: Option<String>,
+    pub shared_folders: Vec<SharedFolderDto>,
+    pub suspended: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +101,7 @@ pub struct VmListItem {
     pub cpus: u32,
     pub memory_mib: u32,
     pub iso: Option<String>,
+    pub suspended: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -151,8 +165,29 @@ impl From<NetworkConfig> for NetworkDto {
     }
 }
 
+impl From<SharedFolderDto> for SharedFolder {
+    fn from(d: SharedFolderDto) -> Self {
+        SharedFolder {
+            host_path: d.host_path,
+            mount_tag: d.mount_tag,
+            read_only: d.read_only,
+        }
+    }
+}
+
+impl From<SharedFolder> for SharedFolderDto {
+    fn from(s: SharedFolder) -> Self {
+        SharedFolderDto {
+            host_path: s.host_path,
+            mount_tag: s.mount_tag,
+            read_only: s.read_only,
+        }
+    }
+}
+
 impl From<VmConfig> for VmConfigDto {
     fn from(c: VmConfig) -> Self {
+        let suspended = c.metadata.suspended_snapshot.is_some();
         VmConfigDto {
             id: c.id.to_string(),
             name: c.name,
@@ -160,6 +195,12 @@ impl From<VmConfig> for VmConfigDto {
             disks: c.disks.into_iter().map(DiskDto::from).collect(),
             network: c.network.into(),
             iso: c.iso,
+            shared_folders: c
+                .shared_folders
+                .into_iter()
+                .map(SharedFolderDto::from)
+                .collect(),
+            suspended,
         }
     }
 }
@@ -219,6 +260,7 @@ pub async fn create_vm(
         iso: req.iso.filter(|s| !s.is_empty()),
         metadata: Default::default(),
         snapshots: Vec::new(),
+        shared_folders: Vec::new(),
     };
     state
         .hv
@@ -255,6 +297,9 @@ pub async fn list_vms(state: State<'_, AppState>) -> Result<Vec<VmListItem>, Str
                 cpus: cfg.map(|c| c.hardware.cpus).unwrap_or(0),
                 memory_mib: cfg.map(|c| c.hardware.memory_mib).unwrap_or(0),
                 iso: cfg.and_then(|c| c.iso.clone()),
+                suspended: cfg
+                    .map(|c| c.metadata.suspended_snapshot.is_some())
+                    .unwrap_or(false),
             }
         })
         .collect();
@@ -286,6 +331,7 @@ pub async fn update_vm(
     config.hardware = req.hardware.into();
     config.network = req.network.map(NetworkConfig::from).unwrap_or_default();
     config.iso = req.iso.filter(|s| !s.is_empty());
+    config.shared_folders = req.shared_folders.into_iter().map(Into::into).collect();
     state
         .hv
         .update_config(&id, config)
@@ -367,6 +413,37 @@ pub async fn pause_vm(state: State<'_, AppState>, id: String) -> Result<(), Stri
 #[tauri::command]
 pub async fn resume_vm(state: State<'_, AppState>, id: String) -> Result<(), String> {
     state.hv.resume(&id).await.map_err(|e| e.to_string())
+}
+
+/// Suspend a running VM: capture its RAM/device state to the qcow2 vmstate, then
+/// terminate the process (Phase 5). Distinct from `pause_vm` (= QMP `stop`).
+/// Accelerator-gated below the boundary (refused on aarch64 + HVF).
+#[tauri::command]
+pub async fn suspend_vm(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.hv.suspend(&id).await.map_err(|e| e.to_string())
+}
+
+/// Restore a suspended VM: relaunch with `-S`, `snapshot-load`, then `cont`
+/// (Phase 5). Distinct from `resume_vm` (= QMP `cont` on a paused VM).
+#[tauri::command]
+pub async fn restore_vm(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state
+        .hv
+        .restore_suspended(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Discard a suspended VM's captured state without resuming (escape hatch for
+/// the "Discard & stop" action): clears the suspend marker and deletes the
+/// vmstate snapshot, returning the VM to plain stopped.
+#[tauri::command]
+pub async fn discard_suspend(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state
+        .hv
+        .discard_suspend(&id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ---- Snapshots & clones (Phase 3) ----
@@ -490,6 +567,7 @@ mod tests {
             cpus: 2,
             memory_mib: 2048,
             iso: None,
+            suspended: false,
         };
         let v = serde_json::to_value(&item).unwrap();
         assert_eq!(
@@ -502,11 +580,13 @@ mod tests {
                 "iso",
                 "memory_mib",
                 "name",
-                "state"
+                "state",
+                "suspended"
             ]
         );
         assert_eq!(v["state"], json!("running")); // VmState lowercase
         assert_eq!(v["accelerator"], json!("hvf")); // Accelerator lowercase
+        assert_eq!(v["suspended"], json!(false)); // derived suspended-ness
     }
 
     #[test]
@@ -529,16 +609,56 @@ mod tests {
                 port_forwards: vec![],
             },
             iso: Some("/x.iso".into()),
+            shared_folders: vec![SharedFolderDto {
+                host_path: "/host/share".into(),
+                mount_tag: "share0".into(),
+                read_only: true,
+            }],
+            suspended: true,
         };
         let v = serde_json::to_value(&dto).unwrap();
         assert_eq!(
             keys(&v),
-            ["disks", "hardware", "id", "iso", "name", "network"]
+            [
+                "disks",
+                "hardware",
+                "id",
+                "iso",
+                "name",
+                "network",
+                "shared_folders",
+                "suspended"
+            ]
         );
         assert_eq!(keys(&v["hardware"]), ["cpus", "memory_mib"]);
         assert_eq!(keys(&v["network"]), ["mac", "mode", "port_forwards"]);
         assert_eq!(v["network"]["mode"], json!("host-only")); // NetworkMode kebab
         assert_eq!(keys(&v["disks"][0]), ["backing", "path", "size_gib"]);
+        assert_eq!(
+            keys(&v["shared_folders"][0]),
+            ["host_path", "mount_tag", "read_only"]
+        );
+        assert_eq!(v["suspended"], json!(true)); // derived suspended-ness
+    }
+
+    #[test]
+    fn shared_folder_dto_wire_shape() {
+        let dto = SharedFolderDto {
+            host_path: "/host/share".into(),
+            mount_tag: "share0".into(),
+            read_only: true,
+        };
+        let v = serde_json::to_value(&dto).unwrap();
+        assert_eq!(keys(&v), ["host_path", "mount_tag", "read_only"]);
+        assert_eq!(v["host_path"], json!("/host/share"));
+        assert_eq!(v["mount_tag"], json!("share0"));
+        assert_eq!(v["read_only"], json!(true));
+
+        // `read_only` is `#[serde(default)]` (additive, back-compat): a legacy
+        // folder without it parses with the export-writable default (false).
+        let legacy: SharedFolderDto =
+            serde_json::from_str(r#"{"host_path":"/h","mount_tag":"t"}"#).unwrap();
+        assert!(!legacy.read_only);
     }
 
     #[test]
@@ -595,10 +715,24 @@ mod tests {
         assert!(minimal.network.is_none());
         assert!(minimal.iso.is_none());
 
+        // `shared_folders` is serde-optional on UpdateVmRequest (back-compat):
+        // a legacy payload without it parses to an empty Vec.
         let update: UpdateVmRequest =
             serde_json::from_str(r#"{"name":"n2","hardware":{"cpus":4,"memory_mib":4096}}"#)
                 .unwrap();
         assert_eq!(update.hardware.cpus, 4);
+        assert!(update.shared_folders.is_empty());
+
+        // With shared_folders present: parsed snake_case, read_only optional.
+        let update_sf: UpdateVmRequest = serde_json::from_str(
+            r#"{"name":"n3","hardware":{"cpus":2,"memory_mib":2048},"shared_folders":[{"host_path":"/h","mount_tag":"t","read_only":true},{"host_path":"/h2","mount_tag":"t2"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(update_sf.shared_folders.len(), 2);
+        assert_eq!(update_sf.shared_folders[0].host_path, "/h");
+        assert_eq!(update_sf.shared_folders[0].mount_tag, "t");
+        assert!(update_sf.shared_folders[0].read_only);
+        assert!(!update_sf.shared_folders[1].read_only);
     }
 
     #[test]

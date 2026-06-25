@@ -94,6 +94,30 @@ describe("ipc wrappers call invoke with the exact command + arg shape", () => {
     expect(invoke).toHaveBeenLastCalledWith("resume_vm", { id: "a" });
   });
 
+  // ---- Phase 5 suspend / restore wrappers ----
+
+  it("suspendVm invokes suspend_vm (NOT pause_vm) with { id }", () => {
+    ipc.suspendVm("a");
+    expect(invoke).toHaveBeenLastCalledWith("suspend_vm", { id: "a" });
+  });
+
+  it("restoreVm invokes restore_vm (NOT resume_vm) with { id }", () => {
+    ipc.restoreVm("a");
+    expect(invoke).toHaveBeenLastCalledWith("restore_vm", { id: "a" });
+  });
+
+  it("discardSuspend invokes discard_suspend with { id }", () => {
+    ipc.discardSuspend("a");
+    expect(invoke).toHaveBeenLastCalledWith("discard_suspend", { id: "a" });
+  });
+
+  it("resumeVm and restoreVm are distinct commands", () => {
+    ipc.resumeVm("a");
+    expect(invoke).toHaveBeenLastCalledWith("resume_vm", { id: "a" });
+    ipc.restoreVm("a");
+    expect(invoke).toHaveBeenLastCalledWith("restore_vm", { id: "a" });
+  });
+
   // ---- Phase 3 snapshot / clone wrappers ----
 
   it("listSnapshots passes { id }", () => {

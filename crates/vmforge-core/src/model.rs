@@ -28,6 +28,13 @@ pub struct VmMetadata {
     pub notes: String,
     #[serde(default)]
     pub os_hint: Option<String>,
+    /// When `Some`, this VM is suspended: its RAM/device state was captured to
+    /// the qcow2 vmstate under this tag (the uuid's string form). A suspended VM
+    /// is `Stopped` on the wire; "suspended-ness" is derived from this field.
+    /// Excluded from `VmConfig.snapshots[]` (never in the tree). Phase-4 configs
+    /// load with `None` (additive).
+    #[serde(default)]
+    pub suspended_snapshot: Option<Uuid>,
 }
 
 /// VM lifecycle. Transitions are driven by the engine and reflected from
@@ -79,6 +86,21 @@ pub struct SnapshotNode {
     pub children: Vec<Uuid>,
 }
 
+/// A host directory shared into the guest over virtio-9p. Emitted at launch as
+/// a `-fsdev local,...,security_model=mapped-xattr` + `-device virtio-9p-pci`
+/// pair (decision A). Mount inside a Linux/Unix guest with:
+/// `mount -t 9p -o trans=virtio,version=9p2000.L <mount_tag> /mnt/shared`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedFolder {
+    /// Absolute host directory; must exist at launch.
+    pub host_path: String,
+    /// 9p mount tag the guest mounts by. Charset `[A-Za-z0-9._-]`, ≤31 bytes.
+    pub mount_tag: String,
+    /// When `true`, the share is exported read-only (`,readonly=on`).
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 /// Full persisted configuration for one VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmConfig {
@@ -108,6 +130,10 @@ pub struct VmConfig {
     /// empty array (additive, no schema bump).
     #[serde(default)]
     pub snapshots: Vec<Snapshot>,
+    /// virtio-9p shared host folders. Phase-4 configs load with an empty array
+    /// (additive, no schema bump).
+    #[serde(default)]
+    pub shared_folders: Vec<SharedFolder>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,6 +337,17 @@ mod tests {
         let net_v = serde_json::to_value(&net).unwrap();
         assert_keys(&net_v, &["mode", "mac", "port_forwards"]);
         assert_eq!(net_v["mode"], "host-only");
+
+        // SharedFolder (↔ SharedFolderDto) — exact snake_case field names.
+        let sf = SharedFolder {
+            host_path: "/host/share".into(),
+            mount_tag: "share".into(),
+            read_only: false,
+        };
+        assert_keys(
+            &serde_json::to_value(&sf).unwrap(),
+            &["host_path", "mount_tag", "read_only"],
+        );
 
         // VmSummary — carries the lowercase state + accelerator enums.
         let summary = VmSummary {

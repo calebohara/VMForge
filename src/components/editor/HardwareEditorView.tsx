@@ -22,10 +22,12 @@ import { StatusBadge } from "@/components/common/StatusBadge";
 import { ProcessorsTab } from "@/components/editor/tabs/ProcessorsTab";
 import { MemoryTab } from "@/components/editor/tabs/MemoryTab";
 import { NetworkTab } from "@/components/editor/tabs/NetworkTab";
+import { SharedFoldersTab } from "@/components/editor/tabs/SharedFoldersTab";
 import { getVm, updateVm } from "@/lib/ipc";
-import type { NetworkConfig, VmConfig, VmState } from "@/lib/ipc";
+import type { NetworkConfig, SharedFolder, VmConfig, VmState } from "@/lib/ipc";
 import {
   normalizeNetwork,
+  normalizeSharedFolders,
   validateCpus,
   validateMemoryMib,
   validateVmName,
@@ -38,6 +40,8 @@ interface EditorDraft {
   /** Full network config (A10): round-trips mode + MAC + port forwards. */
   network: NetworkConfig;
   iso: string;
+  /** virtio-9p shared folders (Phase 5). */
+  shared: SharedFolder[];
 }
 
 function draftFromConfig(c: VmConfig): EditorDraft {
@@ -52,6 +56,7 @@ function draftFromConfig(c: VmConfig): EditorDraft {
       port_forwards: c.network.port_forwards.map((pf) => ({ ...pf })),
     },
     iso: c.iso ?? "",
+    shared: (c.shared_folders ?? []).map((sf) => ({ ...sf })),
   };
 }
 
@@ -87,6 +92,7 @@ export function HardwareEditorView({
   const [original, setOriginal] = useState<VmConfig | null>(null);
   const [draft, setDraft] = useState<EditorDraft | null>(null);
   const [networkValid, setNetworkValid] = useState(true);
+  const [sharedValid, setSharedValid] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -122,7 +128,8 @@ export function HardwareEditorView({
       base.cpus !== draft.cpus ||
       base.memoryMib !== draft.memoryMib ||
       JSON.stringify(base.network) !== JSON.stringify(draft.network) ||
-      base.iso !== draft.iso
+      base.iso !== draft.iso ||
+      JSON.stringify(base.shared) !== JSON.stringify(draft.shared)
     );
   }, [original, draft]);
 
@@ -132,7 +139,8 @@ export function HardwareEditorView({
     nameError === null &&
     validateCpus(draft.cpus) === null &&
     validateMemoryMib(draft.memoryMib) === null &&
-    networkValid;
+    networkValid &&
+    sharedValid;
 
   const discard = () => {
     if (original) setDraft(draftFromConfig(original));
@@ -149,6 +157,7 @@ export function HardwareEditorView({
         hardware: { cpus: draft.cpus, memory_mib: draft.memoryMib },
         network: normalizeNetwork(draft.network),
         iso: draft.iso.trim() ? draft.iso.trim() : null,
+        shared_folders: normalizeSharedFolders(draft.shared),
       });
       onSaved();
     } catch (e) {
@@ -224,6 +233,7 @@ export function HardwareEditorView({
                 <TabsTrigger value="processors">Processors</TabsTrigger>
                 <TabsTrigger value="memory">Memory</TabsTrigger>
                 <TabsTrigger value="network">Network</TabsTrigger>
+                <TabsTrigger value="shared">Shared folders</TabsTrigger>
               </TabsList>
 
               <TabsContent value="processors" className="pt-4">
@@ -249,6 +259,15 @@ export function HardwareEditorView({
                   disabled={locked}
                   onChange={(network) => patch({ network })}
                   onValidityChange={setNetworkValid}
+                />
+              </TabsContent>
+
+              <TabsContent value="shared" className="pt-4">
+                <SharedFoldersTab
+                  value={draft.shared}
+                  disabled={locked}
+                  onChange={(shared) => patch({ shared })}
+                  onValidityChange={setSharedValid}
                 />
               </TabsContent>
             </Tabs>

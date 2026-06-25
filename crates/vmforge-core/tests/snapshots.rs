@@ -33,6 +33,7 @@ fn config(name: &str) -> VmConfig {
         iso: None,
         metadata: Default::default(),
         snapshots: Vec::new(),
+        shared_folders: Vec::new(),
     }
 }
 

@@ -2,7 +2,7 @@
 // server-side checks in `vmforge-core::library::validate_vm_name` and
 // `vmforge-core::qemu::net`; the backend is authoritative. No React, no IPC —
 // directly unit-testable.
-import type { NetworkConfig, PortForward } from "@/lib/ipc";
+import type { NetworkConfig, PortForward, SharedFolder } from "@/lib/ipc";
 
 /** Clamp bounds, kept in sync with the server-side clamps in `create_vm`. */
 export const MIN_CPUS = 1;
@@ -22,6 +22,16 @@ export const MAX_PORT = 65535;
 export const PRIVILEGED_PORT_CEILING = 1024;
 /** Upper bound on the number of port forwards a single VM may define. */
 export const MAX_PORT_FORWARDS = 32;
+
+// ---- Phase 5 shared-folder constants ----
+
+/** Upper bound on the number of shared folders a single VM may define. */
+export const MAX_SHARED_FOLDERS = 8;
+/**
+ * Max 9p mount-tag length in bytes. Mirrors `is_safe_mount_tag` in
+ * `vmforge-core::library` (≤31 bytes).
+ */
+export const MAX_MOUNT_TAG_LEN = 31;
 
 // Windows-reserved device names (case-insensitive), mirrors the server list.
 const WINDOWS_RESERVED = new Set([
@@ -226,4 +236,64 @@ export function normalizeNetwork(net: NetworkConfig): NetworkConfig {
     .filter((pf) => Number.isInteger(pf.host) && Number.isInteger(pf.guest))
     .map((pf) => ({ ...pf }));
   return { mode: net.mode, mac, port_forwards };
+}
+
+// ---- Phase 5 shared-folder validators (mirror `vmforge-core::library`) ----
+
+// 9p mount-tag charset: `[A-Za-z0-9._-]` only (comma-free, so it is NOT esc'd
+// in the QEMU args). Mirrors `is_safe_mount_tag`.
+const MOUNT_TAG_CHARSET = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * Validate a 9p mount tag. Returns `null` when valid, otherwise a human
+ * message. Mirrors `is_safe_mount_tag`: non-empty, ≤31 bytes, no leading `-`,
+ * charset `[A-Za-z0-9._-]`.
+ */
+export function validateMountTag(tag: string): string | null {
+  if (tag.length === 0) return "Mount tag is required.";
+  // Charset is single-byte ASCII, so character length == byte length here.
+  if (tag.length > MAX_MOUNT_TAG_LEN) {
+    return `Mount tag must be ${MAX_MOUNT_TAG_LEN} characters or fewer.`;
+  }
+  if (tag.startsWith("-")) return "Mount tag cannot start with “-”.";
+  if (!MOUNT_TAG_CHARSET.test(tag)) {
+    return "Mount tag may only use letters, digits, “.”, “_”, and “-”.";
+  }
+  return null;
+}
+
+/**
+ * Validate the full set of shared folders. Returns a per-row array of error
+ * messages (`null` where the row is valid). Flags an empty host path, an
+ * invalid mount tag, and — on the 2nd+ occurrence — a duplicate mount tag.
+ * Path existence + absoluteness are authoritative server-side; here we only
+ * require a non-empty path (mirrors the lexical client-side checks).
+ */
+export function validateSharedFolders(folders: SharedFolder[]): (string | null)[] {
+  const seen = new Set<string>();
+  return folders.map((sf) => {
+    if (sf.host_path.trim() === "") return "Choose a host folder.";
+    const tagErr = validateMountTag(sf.mount_tag);
+    if (tagErr) return tagErr;
+    if (seen.has(sf.mount_tag)) {
+      return `Duplicate mount tag “${sf.mount_tag}”.`;
+    }
+    seen.add(sf.mount_tag);
+    return null;
+  });
+}
+
+/**
+ * Normalize an edited shared-folder list for submission: trim the host path and
+ * mount tag, and drop rows where either is blank after trimming. Pure — used by
+ * the hardware editor's save payload.
+ */
+export function normalizeSharedFolders(folders: SharedFolder[]): SharedFolder[] {
+  return folders
+    .map((sf) => ({
+      host_path: sf.host_path.trim(),
+      mount_tag: sf.mount_tag.trim(),
+      read_only: sf.read_only,
+    }))
+    .filter((sf) => sf.host_path !== "" && sf.mount_tag !== "");
 }

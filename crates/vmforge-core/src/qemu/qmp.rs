@@ -316,6 +316,32 @@ mod tests {
         assert!(res.is_ok(), "absent job => Ok, got {res:?}");
     }
 
+    // snapshot-load run_job concludes then dismisses (suspend/resume path, §E).
+    // Same scripted harness as snapshot-save: queue accepted → one query-jobs
+    // reply with the job "concluded" and no error → dismiss → Ok.
+    #[tokio::test]
+    async fn run_job_snapshot_load_concludes_then_dismisses() {
+        let mut c = QmpClient::scripted(&[
+            // 1. response to the queued snapshot-load command
+            json!({"return": {}}),
+            // 2. response to query-jobs: job concluded, no error
+            json!({"return": [
+                {"id": "job-load", "type": "snapshot-load", "status": "concluded", "error": null}
+            ]}),
+            // 3. response to job-dismiss
+            json!({"return": {}}),
+        ]);
+        let res = c
+            .run_job(
+                "snapshot-load",
+                json!({"job-id": "job-load", "tag": "t", "vmstate": "disk0", "devices": ["disk0"]}),
+                "job-load",
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(res.is_ok(), "expected Ok, got {res:?}");
+    }
+
     // query-jobs parses a JobInfo list with the type rename.
     #[tokio::test]
     async fn query_jobs_parses_job_info() {

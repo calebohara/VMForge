@@ -43,8 +43,10 @@ function App() {
       try {
         await fn();
         await refresh();
+        return true;
       } catch (e) {
         toast.error(`${label} failed`, { description: String(e) });
+        return false;
       } finally {
         setBusy(id, false);
       }
@@ -85,6 +87,26 @@ function App() {
     [setBusy, refresh],
   );
 
+  // Restore a suspended VM and jump straight into its console — mirrors
+  // startAndConsole, but uses restore_vm (relaunch + snapshot-load + cont).
+  const restoreAndConsole = useCallback(
+    async (id: string) => {
+      setBusy(id, true);
+      try {
+        await ipc.restoreVm(id);
+        const wsPort = await ipc.openConsole(id);
+        setView({ kind: "console", vmId: id, wsPort });
+        void refresh();
+      } catch (e) {
+        toast.error("Could not resume VM", { description: String(e) });
+        void refresh();
+      } finally {
+        setBusy(id, false);
+      }
+    },
+    [setBusy, refresh],
+  );
+
   const actions: VmActions = {
     onStart: (vm) => void startAndConsole(vm.id),
     onShutdown: (vm) =>
@@ -102,6 +124,13 @@ function App() {
     onClone: () => {
       /* handled by LibraryView's clone dialog */
     },
+    onSuspend: (vm) =>
+      void runAction(vm.id, "Suspend", () => ipc.suspendVm(vm.id)),
+    onRestore: (vm) => void restoreAndConsole(vm.id),
+    onDiscard: (vm) =>
+      void runAction(vm.id, "Discard suspend", () =>
+        ipc.discardSuspend(vm.id),
+      ),
   };
 
   const confirmDelete = useCallback(
@@ -254,6 +283,15 @@ function App() {
           }
           onResume={() =>
             void runAction(view.vmId, "Resume", () => ipc.resumeVm(view.vmId))
+          }
+          onSuspend={() =>
+            void runAction(view.vmId, "Suspend", () =>
+              ipc.suspendVm(view.vmId),
+            ).then((ok) => {
+              // Only leave the console if the suspend actually succeeded; on a
+              // refusal (e.g. HVF gate) keep the still-running console up.
+              if (ok) backToLibrary();
+            })
           }
           onShutdown={() =>
             void runAction(view.vmId, "Shut down", () => ipc.powerOff(view.vmId))

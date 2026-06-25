@@ -1,4 +1,4 @@
-import { Camera, Pause, Play, Power, Square } from "lucide-react";
+import { Camera, Moon, Pause, Play, Power, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/common/StatusBadge";
 import { VncConsole } from "@/components/VncConsole";
@@ -17,6 +17,7 @@ export function ConsoleView({
   busy,
   onPause,
   onResume,
+  onSuspend,
   onShutdown,
   onForceOff,
   onBack,
@@ -28,6 +29,8 @@ export function ConsoleView({
   busy?: boolean;
   onPause: () => void;
   onResume: () => void;
+  /** Suspend the running VM: capture live state, power off, return to library. */
+  onSuspend: () => void;
   onShutdown: () => void;
   onForceOff: () => void;
   onBack: () => void;
@@ -61,6 +64,14 @@ export function ConsoleView({
             <Pause className="h-4 w-4" /> Pause
           </Button>
         )}
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy || state !== "running"}
+          onClick={onSuspend}
+        >
+          <Moon className="h-4 w-4" /> Suspend
+        </Button>
         <Button size="sm" variant="outline" disabled={busy} onClick={onShutdown}>
           <Power className="h-4 w-4" /> Shut down
         </Button>

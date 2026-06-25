@@ -10,14 +10,34 @@ const TONE_CLASSES: Record<StateTone, { dot: string; text: string }> = {
   error: { dot: "bg-destructive", text: "text-destructive" },
 };
 
-/** Lifecycle-state pill: colored dot + label. Used in the library and console. */
+/**
+ * Lifecycle-state pill: colored dot + label. Used in the library and console.
+ * When {@link suspended} is true (Phase 5) the VM is `stopped` on the wire but
+ * carries a captured live snapshot — render a violet "Suspended" pill instead.
+ */
 export function StatusBadge({
   state,
+  suspended,
   className,
 }: {
   state: VmState;
+  suspended?: boolean;
   className?: string;
 }) {
+  if (suspended && state === "stopped") {
+    return (
+      <span
+        className={cn(
+          "inline-flex items-center gap-1.5 rounded-full border border-border px-2.5 py-1 text-xs font-medium text-violet-400",
+          className,
+        )}
+      >
+        <span className="h-1.5 w-1.5 rounded-full bg-violet-500" />
+        Suspended
+      </span>
+    );
+  }
+
   const tone = TONE_CLASSES[stateTone(state)];
   return (
     <span

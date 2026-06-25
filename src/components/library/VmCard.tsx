@@ -23,7 +23,7 @@ export function VmCard({
           {vm.name}
         </CardTitle>
         <div className="flex flex-wrap items-center gap-2">
-          <StatusBadge state={vm.state} />
+          <StatusBadge state={vm.state} suspended={vm.suspended} />
           <AccelBadge accel={vm.accelerator} emulated={vm.emulated} />
         </div>
       </CardHeader>

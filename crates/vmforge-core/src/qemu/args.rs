@@ -34,6 +34,10 @@ pub struct QemuLaunch<'a> {
     /// engine builds (and validates) these BEFORE spawn so an unavailable mode
     /// is rejected up front; `build_args` itself stays infallible.
     pub network: Vec<String>,
+    /// When `true`, launch QEMU paused (`-S`) so a `snapshot-load` can run on
+    /// the QMP channel before the guest CPUs start (suspend/resume). Cold starts
+    /// pass `false` and `-S` is never emitted.
+    pub prelaunch: bool,
 }
 
 /// Build the full QEMU argument vector (everything after the binary name).
@@ -124,6 +128,34 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
         QmpEndpoint::Tcp(port) => flag("-qmp", format!("tcp:127.0.0.1:{port},server=on,wait=off")),
     }
 
+    // virtio-9p shared folders (decision A): a two-part fragment per folder —
+    // `-fsdev local,id=fsdevN,path=<host>,security_model=mapped-xattr[,readonly=on]`
+    // names the host export (privilege-free, perms preserved via xattrs), and
+    // `-device virtio-9p-pci,fsdev=fsdevN,mount_tag=<tag>` attaches it under the
+    // guest mount tag. `path=` is comma-escaped via `esc` (it lives inside an
+    // option-list value); `mount_tag` is validated comma-free upstream. The
+    // `local` form NEVER offers `passthrough` (needs root).
+    for (i, sf) in l.config.shared_folders.iter().enumerate() {
+        let ro = if sf.read_only { ",readonly=on" } else { "" };
+        flag(
+            "-fsdev",
+            format!(
+                "local,id=fsdev{i},path={},security_model=mapped-xattr{ro}",
+                esc(std::path::Path::new(&sf.host_path))
+            ),
+        );
+        flag(
+            "-device",
+            format!("virtio-9p-pci,fsdev=fsdev{i},mount_tag={}", sf.mount_tag),
+        );
+    }
+
+    // Suspend/resume prelaunch: start paused so `snapshot-load` + `cont` can run
+    // on QMP before the guest executes. Cold starts never emit `-S`.
+    if l.prelaunch {
+        push("-S".to_string());
+    }
+
     // Networking: pre-built `-netdev`/`-device` fragments. The engine builds and
     // validates these via `qemu::net::network_args` BEFORE spawn (rejecting any
     // unavailable mode), so `build_args` just splices them in and stays
@@ -157,6 +189,7 @@ mod tests {
             iso: None,
             metadata: Default::default(),
             snapshots: Vec::new(),
+            shared_folders: Vec::new(),
         }
     }
 
@@ -185,6 +218,7 @@ mod tests {
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
             network: vec![],
+            prelaunch: false,
         });
         let joined = args.join(" ");
         assert!(
@@ -214,6 +248,7 @@ mod tests {
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
             network: vec![],
+            prelaunch: false,
         });
         assert_eq!(
             find_flag(&args, "-drive"),
@@ -249,6 +284,7 @@ mod tests {
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
             network,
+            prelaunch: false,
         });
         assert!(
             !args.iter().any(|a| a == "-snapshot"),
@@ -277,6 +313,7 @@ mod tests {
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
             network: vec![],
+            prelaunch: false,
         });
         assert_eq!(find_flag(&args, "-machine"), Some("virt"));
         assert_eq!(find_flag(&args, "-accel"), Some("hvf"));
@@ -305,6 +342,7 @@ mod tests {
             vnc_display: 0,
             qmp: QmpEndpoint::Tcp(4444),
             network: vec![],
+            prelaunch: false,
         });
         assert_eq!(find_flag(&args, "-cpu"), Some("cortex-a72"));
         assert_eq!(
@@ -329,6 +367,7 @@ mod tests {
             vnc_display: 2,
             qmp: QmpEndpoint::UnixSocket(&sock),
             network: vec![],
+            prelaunch: false,
         });
         let joined = args.join(" ");
         assert!(joined.contains("file=/iso/alpine.iso,if=virtio,media=cdrom,format=raw"));
@@ -361,10 +400,172 @@ mod tests {
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
             network,
+            prelaunch: false,
         });
         assert_eq!(
             find_flag(&args, "-netdev"),
             Some("user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22")
+        );
+    }
+
+    // ---- Phase 5 — virtio-9p shared folders + prelaunch -S ----
+
+    use crate::model::SharedFolder;
+
+    /// Build args for a config with the given shared folders + prelaunch flag,
+    /// returning the full argv (aarch64/HVF, no ISO).
+    fn args_with(shared_folders: Vec<SharedFolder>, prelaunch: bool) -> Vec<String> {
+        let mut c = cfg();
+        c.shared_folders = shared_folders;
+        let disk = PathBuf::from("/vm/disk.qcow2");
+        let sock = PathBuf::from("/vm/qmp.sock");
+        build_args(&QemuLaunch {
+            config: &c,
+            accel: Accelerator::Hvf,
+            guest_arch: "aarch64",
+            disk: &disk,
+            iso: None,
+            firmware: Some(Path::new("/fw/x.fd")),
+            vnc_display: 1,
+            qmp: QmpEndpoint::UnixSocket(&sock),
+            network: vec![],
+            prelaunch,
+        })
+    }
+
+    #[test]
+    fn shared_folder_emits_fsdev_and_device() {
+        let args = args_with(
+            vec![SharedFolder {
+                host_path: "/home/user/share".into(),
+                mount_tag: "share".into(),
+                read_only: false,
+            }],
+            false,
+        );
+        let joined = args.join(" ");
+        assert!(
+            joined.contains(
+                "-fsdev local,id=fsdev0,path=/home/user/share,security_model=mapped-xattr"
+            ),
+            "fsdev fragment missing/wrong: {joined}"
+        );
+        assert!(
+            joined.contains("-device virtio-9p-pci,fsdev=fsdev0,mount_tag=share"),
+            "9p device fragment missing/wrong: {joined}"
+        );
+        // No readonly suffix when read_only == false.
+        assert!(
+            !joined.contains("readonly=on"),
+            "must not emit readonly=on for a writable share: {joined}"
+        );
+    }
+
+    #[test]
+    fn shared_folder_readonly_appends_flag() {
+        let args = args_with(
+            vec![SharedFolder {
+                host_path: "/data".into(),
+                mount_tag: "ro".into(),
+                read_only: true,
+            }],
+            false,
+        );
+        let joined = args.join(" ");
+        assert!(
+            joined.contains(
+                "-fsdev local,id=fsdev0,path=/data,security_model=mapped-xattr,readonly=on"
+            ),
+            "readonly fsdev fragment missing/wrong: {joined}"
+        );
+    }
+
+    #[test]
+    fn shared_folder_host_path_comma_escaped() {
+        // A comma in the host path must be doubled so QEMU treats it as literal,
+        // not an option separator (injection guard, decision A).
+        let args = args_with(
+            vec![SharedFolder {
+                host_path: "/host/we,ird".into(),
+                mount_tag: "tag".into(),
+                read_only: false,
+            }],
+            false,
+        );
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("path=/host/we,,ird,security_model=mapped-xattr"),
+            "host_path comma not escaped: {joined}"
+        );
+    }
+
+    #[test]
+    fn multiple_shared_folders_index_fsdev_ids() {
+        let args = args_with(
+            vec![
+                SharedFolder {
+                    host_path: "/a".into(),
+                    mount_tag: "first".into(),
+                    read_only: false,
+                },
+                SharedFolder {
+                    host_path: "/b".into(),
+                    mount_tag: "second".into(),
+                    read_only: true,
+                },
+            ],
+            false,
+        );
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("local,id=fsdev0,path=/a,security_model=mapped-xattr")
+                && joined.contains("virtio-9p-pci,fsdev=fsdev0,mount_tag=first"),
+            "folder 0 indexing wrong: {joined}"
+        );
+        assert!(
+            joined.contains("local,id=fsdev1,path=/b,security_model=mapped-xattr,readonly=on")
+                && joined.contains("virtio-9p-pci,fsdev=fsdev1,mount_tag=second"),
+            "folder 1 indexing wrong: {joined}"
+        );
+    }
+
+    #[test]
+    fn prelaunch_appends_dash_s() {
+        let args = args_with(vec![], true);
+        assert!(
+            args.iter().any(|a| a == "-S"),
+            "prelaunch must emit -S: {args:?}"
+        );
+    }
+
+    #[test]
+    fn cold_start_never_emits_dash_s() {
+        // A cold start (prelaunch == false) must NEVER pause the guest with -S,
+        // even with shared folders + an ISO present (broadest arg set).
+        let mut c = cfg();
+        c.iso = Some("/iso/alpine.iso".into());
+        c.shared_folders = vec![SharedFolder {
+            host_path: "/share".into(),
+            mount_tag: "share".into(),
+            read_only: false,
+        }];
+        let disk = PathBuf::from("/vm/disk.qcow2");
+        let sock = PathBuf::from("/vm/qmp.sock");
+        let args = build_args(&QemuLaunch {
+            config: &c,
+            accel: Accelerator::Hvf,
+            guest_arch: "aarch64",
+            disk: &disk,
+            iso: Some(Path::new("/iso/alpine.iso")),
+            firmware: Some(Path::new("/fw/x.fd")),
+            vnc_display: 1,
+            qmp: QmpEndpoint::UnixSocket(&sock),
+            network: vec![],
+            prelaunch: false,
+        });
+        assert!(
+            !args.iter().any(|a| a == "-S"),
+            "cold start must never emit -S: {args:?}"
         );
     }
 }

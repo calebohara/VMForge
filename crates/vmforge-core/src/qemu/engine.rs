@@ -80,6 +80,18 @@ impl QemuHypervisor {
         })
     }
 
+    /// Build with an explicit library directory and a forced accelerator.
+    ///
+    /// Test/dev seam: the suspend/resume round-trip relies on QMP
+    /// `snapshot-load`, which crashes under HVF on aarch64 — so verifying it on
+    /// this host requires forcing TCG. Production code uses [`new`](Self::new) /
+    /// [`with_library_dir`](Self::with_library_dir), which always probe.
+    pub fn with_library_dir_and_accel(library_dir: PathBuf, accel: Accelerator) -> Result<Self> {
+        let mut hv = Self::with_library_dir(library_dir)?;
+        hv.accel = accel;
+        Ok(hv)
+    }
+
     /// Host VNC port for a running VM (for the noVNC bridge / IPC).
     pub async fn vnc_port(&self, id: &str) -> Result<u16> {
         Ok(self.get(id).await?.vnc_port)
@@ -293,6 +305,14 @@ impl QemuHypervisor {
         // cannot launch the VM in the TOCTOU window after the check.
         let _g = self.start_lock.lock().await;
         self.reject_if_live(id, "edit").await?;
+        // Editing while suspended is refused: the persisted config must match the
+        // captured vmstate it will resume into. Resume or discard first.
+        let current = self.get_config(id).await?;
+        if current.metadata.suspended_snapshot.is_some() {
+            return Err(Error::Config(format!(
+                "cannot edit VM {id} while it is suspended; resume or discard the suspended state first"
+            )));
+        }
         self.library.save_config(&updated).await?;
         let parsed = parse_id(id)?;
         self.library.load_config(&parsed).await
@@ -570,29 +590,17 @@ impl QemuHypervisor {
             ))),
         }
     }
-}
 
-/// Routing decision for a snapshot create/delete (A3).
-enum SnapshotRoute {
-    /// Live VM — drive the op as a QMP job on this handle's `qmp` channel.
-    Live(Arc<RunningVm>),
-    /// Stopped/Defined VM — drive the op with the offline `qemu-img` runner.
-    Offline,
-}
+    // ---- start (cold + resume) + suspend/restore (Phase 5) ----
 
-/// Parse an id string into a [`VmId`], mapping a bad id to [`Error::VmNotFound`].
-fn parse_id(id: &str) -> Result<VmId> {
-    id.parse::<VmId>()
-        .map_err(|_| Error::VmNotFound(id.to_string()))
-}
-
-#[async_trait]
-impl Hypervisor for QemuHypervisor {
-    fn accelerator(&self) -> Accelerator {
-        self.accel
-    }
-
-    async fn start(&self, config: &VmConfig) -> Result<()> {
+    /// Launch a VM. With `prelaunch_load == None` this is a cold start; with
+    /// `Some(tag)` it is a suspend-resume: QEMU is launched paused (`-S`) and the
+    /// stored vmstate `tag` is `snapshot-load`-ed then `cont`-ed on the local
+    /// QMP channel BEFORE the registry insert (lock discipline preserved).
+    ///
+    /// Cold start refuses a suspended VM (resume or discard first). Shared
+    /// folders are validated before `build_args` (existing host dirs, safe tags).
+    pub async fn start_inner(&self, config: &VmConfig, prelaunch_load: Option<Uuid>) -> Result<()> {
         let id = config.id.to_string();
 
         // Serialize the entire start critical section (membership check → VNC
@@ -603,6 +611,15 @@ impl Hypervisor for QemuHypervisor {
         // `running` registry lock is still taken only for the membership check
         // and the final insert — never across the QMP connect.
         let _start_guard = self.start_lock.lock().await;
+
+        // A plain (cold) start of a suspended VM is refused: its vmstate must be
+        // resumed (restore_suspended) or thrown away (discard_suspend) first.
+        // The resume path passes Some(tag), so it bypasses this guard.
+        if prelaunch_load.is_none() && config.metadata.suspended_snapshot.is_some() {
+            return Err(Error::Config(format!(
+                "VM {id} is suspended; resume or discard the suspended state first"
+            )));
+        }
 
         if self.running.lock().await.contains_key(&id) {
             return Err(Error::Config(format!("VM {id} is already running")));
@@ -683,6 +700,11 @@ impl Hypervisor for QemuHypervisor {
             QmpBind::Tcp(port) => QmpEndpoint::Tcp(*port),
         };
 
+        // Validate shared folders BEFORE spawn: existing host dirs, safe unique
+        // tags. An invalid share is rejected here as `Error::Config` rather than
+        // failing opaquely at launch (decision A — validate_shared_folders).
+        crate::library::validate_shared_folders(config)?;
+
         // Build (and validate) the network fragments BEFORE spawning. An
         // unavailable mode (bridged/host-only) or an invalid port-forward/MAC is
         // rejected here as `Error::Config` — never a silent NAT fallback (A3/A4).
@@ -700,6 +722,9 @@ impl Hypervisor for QemuHypervisor {
             vnc_display: display,
             qmp: qmp_arg,
             network,
+            // Resume launches paused so snapshot-load + cont can run before the
+            // guest executes; cold starts run immediately.
+            prelaunch: prelaunch_load.is_some(),
         });
         tracing::info!(target: "vmforge_core::qemu", vm = %config.name, ?args, "launching QEMU");
 
@@ -707,7 +732,7 @@ impl Hypervisor for QemuHypervisor {
 
         // Connect QMP (the server appears shortly after spawn). Kill QEMU and
         // surface its log tail if we can't reach it.
-        let qmp = match connect_qmp(&qmp_bind, Duration::from_secs(15)).await {
+        let mut qmp = match connect_qmp(&qmp_bind, Duration::from_secs(15)).await {
             Ok(c) => c,
             Err(e) => {
                 let _ = proc.kill().await;
@@ -724,6 +749,38 @@ impl Hypervisor for QemuHypervisor {
             }
         };
 
+        // Resume path: load the suspended vmstate and resume execution on the
+        // LOCAL QmpClient (still before the registry insert, so lock discipline
+        // is preserved). On any failure, kill the process + clear its socket and
+        // surface the error — never leave a phantom Running entry.
+        if let Some(tag) = prelaunch_load {
+            let job_id = format!("vmforge-{}", Uuid::new_v4());
+            let result = match qmp
+                .run_job(
+                    "snapshot-load",
+                    json!({
+                        "job-id": job_id.clone(),
+                        "tag": tag.to_string(),
+                        "vmstate": "disk0",
+                        "devices": ["disk0"],
+                    }),
+                    &job_id,
+                    SNAPSHOT_JOB_TIMEOUT,
+                )
+                .await
+            {
+                Ok(()) => qmp.execute("cont", None).await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = result {
+                let _ = proc.kill().await;
+                if let Some(sock) = &qmp_socket {
+                    let _ = tokio::fs::remove_file(sock).await;
+                }
+                return Err(e);
+            }
+        }
+
         self.running.lock().await.insert(
             id,
             Arc::new(RunningVm {
@@ -736,6 +793,181 @@ impl Hypervisor for QemuHypervisor {
             }),
         );
         Ok(())
+    }
+
+    /// Suspend a live VM: capture RAM/device state to a fresh qcow2 vmstate tag,
+    /// persist the tag in `metadata.suspended_snapshot` (BEFORE killing the
+    /// process), then terminate. Accelerator-gated: refused up front on
+    /// `aarch64 + HVF`, where QMP `snapshot-load` crashes (ORCHESTRATOR NOTE), so
+    /// an unresumable vmstate is never captured. Single-disk only.
+    pub async fn suspend(&self, id: &str) -> Result<()> {
+        // Up-front accelerator gate: never capture a vmstate we cannot resume.
+        if self.host_arch == "aarch64" && self.accel.is_hardware() {
+            return Err(Error::Config(
+                "suspend/resume is unavailable with hardware acceleration (HVF) on this host"
+                    .into(),
+            ));
+        }
+
+        let pre = self.get_config(id).await?;
+        // Single-disk scope (the vmstate targets disk0).
+        let _disk = self.single_disk_path(&pre).await?;
+
+        let suspend_id = Uuid::new_v4();
+        let tag = suspend_id.to_string();
+
+        // Route under start_lock so a concurrent start/edit can't race the
+        // check→exec. Only Live (Running/Paused) is suspendable; otherwise
+        // Error::Config. Drop the guard before the (potentially long) QMP job so
+        // it never blocks other VMs.
+        let guard = self.start_lock.lock().await;
+        let vm = match self.snapshot_route(id, "suspend").await? {
+            SnapshotRoute::Live(vm) => vm,
+            SnapshotRoute::Offline => {
+                return Err(Error::Config(format!(
+                    "cannot suspend VM {id}: it is not running"
+                )));
+            }
+        };
+        drop(guard);
+
+        // Stop the CPUs, then save the full vmstate to the qcow2 under `tag`.
+        {
+            let mut qmp = vm.qmp.lock().await;
+            qmp.execute("stop", None).await?;
+            let job_id = format!("vmforge-{}", Uuid::new_v4());
+            qmp.run_job(
+                "snapshot-save",
+                json!({
+                    "job-id": job_id.clone(),
+                    "tag": tag,
+                    "vmstate": "disk0",
+                    "devices": ["disk0"],
+                }),
+                &job_id,
+                SNAPSHOT_JOB_TIMEOUT,
+            )
+            .await?;
+        }
+
+        // Persist the suspend tag BEFORE killing the process: a crash between
+        // here and the kill leaves a resumable, correctly-flagged VM. Re-read a
+        // fresh config (a concurrent rename may have landed during the job) and
+        // apply only the suspend delta (lost-update guard).
+        let mut config = self.get_config(id).await?;
+        config.metadata.suspended_snapshot = Some(suspend_id);
+        self.library.save_config(&config).await?;
+
+        // Terminate (drops the registry entry + deletes the socket). The VM now
+        // reads as Stopped + suspended.
+        self.kill(id).await?;
+        Ok(())
+    }
+
+    /// Resume a suspended VM: verify the stored vmstate tag still exists in the
+    /// qcow2 (else clear the field and refuse — "reset to stopped"), relaunch via
+    /// `start_inner(Some(tag))`, then clear `metadata.suspended_snapshot` so the
+    /// suspend is consumed exactly once.
+    pub async fn restore_suspended(&self, id: &str) -> Result<()> {
+        let config = self.get_config(id).await?;
+        let tag = config
+            .metadata
+            .suspended_snapshot
+            .ok_or_else(|| Error::Config(format!("VM {id} is not suspended")))?;
+
+        // Verify the vmstate tag is actually present in the image. If it has gone
+        // missing (image edited/snapshot deleted out from under us), the suspend
+        // is unresumable: clear the field and refuse so the VM resets to Stopped
+        // rather than getting wedged.
+        let disk = self.single_disk_path(&config).await?;
+        let stdout = crate::storage::info_json(&disk, false).await?;
+        let present = crate::storage::parse_info_snapshots(&stdout)?
+            .iter()
+            .any(|s| s.name == tag.to_string());
+        if !present {
+            let mut reset = self.get_config(id).await?;
+            reset.metadata.suspended_snapshot = None;
+            self.library.save_config(&reset).await?;
+            return Err(Error::Config(format!(
+                "suspended state for VM {id} is missing; reset to stopped"
+            )));
+        }
+
+        // Relaunch paused, load the vmstate, and cont (start_inner handles the
+        // kill-on-failure cleanup).
+        self.start_inner(&config, Some(tag)).await?;
+
+        // The vmstate has been loaded into RAM; the qcow2 internal snapshot it
+        // came from is now orphaned (excluded from the snapshot tree). Delete it
+        // via a live QMP job so repeated suspend/resume cycles don't grow the
+        // image unbounded (~guest RAM per cycle). Best-effort: a failure must
+        // NOT fail the resume — the VM is already running.
+        if let Ok(vm) = self.get(id).await {
+            let job_id = format!("vmforge-{}", Uuid::new_v4());
+            let mut qmp = vm.qmp.lock().await;
+            if let Err(e) = qmp
+                .run_job(
+                    "snapshot-delete",
+                    json!({ "job-id": job_id, "tag": tag.to_string(), "devices": ["disk0"] }),
+                    &job_id,
+                    SNAPSHOT_JOB_TIMEOUT,
+                )
+                .await
+            {
+                tracing::warn!(target: "vmforge_core::qemu", vm = %id, error = %e,
+                    "failed to delete consumed suspend vmstate; orphaned in qcow2");
+            }
+        }
+
+        // Consume the suspend: clear the field and persist (fresh re-read).
+        let mut config = self.get_config(id).await?;
+        config.metadata.suspended_snapshot = None;
+        self.library.save_config(&config).await?;
+        Ok(())
+    }
+
+    /// Discard a suspended VM's captured state without resuming (escape hatch):
+    /// best-effort delete the offline vmstate snapshot, then clear the field so
+    /// the VM is a plain Stopped VM again. A no-op if not suspended.
+    pub async fn discard_suspend(&self, id: &str) -> Result<()> {
+        let config = self.get_config(id).await?;
+        let Some(tag) = config.metadata.suspended_snapshot else {
+            return Ok(());
+        };
+        // Best-effort: the snapshot may already be gone; clearing the field is
+        // the contract that matters.
+        if let Ok(disk) = self.single_disk_path(&config).await {
+            let _ = crate::storage::snapshot_delete_offline(&disk, &tag.to_string()).await;
+        }
+        let mut config = self.get_config(id).await?;
+        config.metadata.suspended_snapshot = None;
+        self.library.save_config(&config).await?;
+        Ok(())
+    }
+}
+
+/// Routing decision for a snapshot create/delete (A3).
+enum SnapshotRoute {
+    /// Live VM — drive the op as a QMP job on this handle's `qmp` channel.
+    Live(Arc<RunningVm>),
+    /// Stopped/Defined VM — drive the op with the offline `qemu-img` runner.
+    Offline,
+}
+
+/// Parse an id string into a [`VmId`], mapping a bad id to [`Error::VmNotFound`].
+fn parse_id(id: &str) -> Result<VmId> {
+    id.parse::<VmId>()
+        .map_err(|_| Error::VmNotFound(id.to_string()))
+}
+
+#[async_trait]
+impl Hypervisor for QemuHypervisor {
+    fn accelerator(&self) -> Accelerator {
+        self.accel
+    }
+
+    async fn start(&self, config: &VmConfig) -> Result<()> {
+        self.start_inner(config, None).await
     }
 
     async fn shutdown(&self, id: &str) -> Result<()> {
@@ -759,6 +991,14 @@ impl Hypervisor for QemuHypervisor {
 
     async fn resume(&self, id: &str) -> Result<()> {
         self.exec(id, "cont").await
+    }
+
+    async fn suspend(&self, id: &str) -> Result<()> {
+        QemuHypervisor::suspend(self, id).await
+    }
+
+    async fn restore_suspended(&self, id: &str) -> Result<()> {
+        QemuHypervisor::restore_suspended(self, id).await
     }
 
     async fn state(&self, id: &str) -> Result<VmState> {
@@ -857,6 +1097,7 @@ mod tests {
             iso: None,
             metadata: Default::default(),
             snapshots: Vec::new(),
+            shared_folders: Vec::new(),
         }
     }
 
@@ -1221,5 +1462,206 @@ mod tests {
         }
 
         drop(listener);
+    }
+
+    // ====================================================================
+    // Phase 5 — suspend / resume + shared-folder validation
+    // ====================================================================
+
+    /// Persist a VM whose config is flagged suspended (a fresh uuid tag), as if
+    /// `suspend` had run. Used by the offline suspend-state tests that don't need
+    /// a live guest. Returns (id_string, suspend_tag).
+    async fn persist_suspended(hv: &QemuHypervisor, name: &str, slug: &str) -> (String, Uuid) {
+        let vm = hv
+            .create_vm(defined_config(Uuid::new_v4(), name, slug))
+            .await
+            .unwrap();
+        let id = vm.id.to_string();
+        let tag = Uuid::new_v4();
+        let mut cfg = hv.get_config(&id).await.unwrap();
+        cfg.metadata.suspended_snapshot = Some(tag);
+        hv.library.save_config(&cfg).await.unwrap();
+        (id, tag)
+    }
+
+    // ---- suspend is refused up-front on aarch64 + HVF (ORCHESTRATOR NOTE) ----
+    #[tokio::test]
+    async fn suspend_refused_under_hvf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let hv = QemuHypervisor::with_library_dir(tmp.path().to_path_buf()).expect("build hv");
+        let vm = hv
+            .create_vm(defined_config(Uuid::new_v4(), "Suspendee", "suspendee"))
+            .await
+            .unwrap();
+        let id = vm.id.to_string();
+
+        // The gate fires only on aarch64 + a hardware accelerator (HVF/KVM/WHPX).
+        // On this dev host (M4 + HVF) it fires; on a TCG host it would route to
+        // the "not running" refusal instead. Either way suspend errors here (the
+        // VM is not live), so assert the specific gate message when applicable.
+        let err = hv.suspend(&id).await.expect_err("suspend must error");
+        if std::env::consts::ARCH == "aarch64" && hv.accelerator().is_hardware() {
+            match err {
+                Error::Config(m) => assert!(
+                    m.contains("hardware acceleration (HVF)"),
+                    "expected the HVF gate message, got: {m}"
+                ),
+                other => panic!("expected Error::Config(HVF gate), got {other:?}"),
+            }
+        } else {
+            // Off the gated host the call still fails (VM not running).
+            assert!(matches!(err, Error::Config(_)), "got {err:?}");
+        }
+        // No suspend state was captured.
+        let cfg = hv.get_config(&id).await.unwrap();
+        assert!(cfg.metadata.suspended_snapshot.is_none());
+    }
+
+    // ---- restore with a missing vmstate tag clears the field + refuses ----
+    #[tokio::test]
+    async fn restore_missing_suspend_state_resets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let hv = QemuHypervisor::with_library_dir(tmp.path().to_path_buf()).expect("build hv");
+        let (id, _tag) = persist_suspended(&hv, "Ghost", "ghost").await;
+
+        // The mock `info` returns NO internal snapshots, so the stored tag is
+        // absent → restore must clear the field and refuse ("reset to stopped").
+        let err = hv
+            .restore_suspended(&id)
+            .await
+            .expect_err("restore of a missing vmstate must fail");
+        match err {
+            Error::Config(m) => assert!(
+                m.contains("reset to stopped"),
+                "expected reset-to-stopped message, got: {m}"
+            ),
+            other => panic!("expected Error::Config(reset to stopped), got {other:?}"),
+        }
+        // The field was cleared so the VM is a plain Stopped VM again.
+        let cfg = hv.get_config(&id).await.unwrap();
+        assert!(
+            cfg.metadata.suspended_snapshot.is_none(),
+            "suspended_snapshot must be cleared on a missing-vmstate restore"
+        );
+    }
+
+    // ---- editing a suspended VM is refused (config must match the vmstate) ----
+    #[tokio::test]
+    async fn edit_refused_while_suspended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let hv = QemuHypervisor::with_library_dir(tmp.path().to_path_buf()).expect("build hv");
+        let (id, _tag) = persist_suspended(&hv, "Frozen", "frozen").await;
+
+        let mut edited = hv.get_config(&id).await.unwrap();
+        edited.hardware.cpus = 8;
+        let err = hv
+            .update_config(&id, edited)
+            .await
+            .expect_err("editing a suspended VM must fail");
+        match err {
+            Error::Config(m) => assert!(
+                m.contains("suspended"),
+                "expected a suspended-edit refusal, got: {m}"
+            ),
+            other => panic!("expected Error::Config(suspended), got {other:?}"),
+        }
+    }
+
+    // ---- a plain cold start of a suspended VM is refused (resume/discard) ----
+    #[tokio::test]
+    async fn start_refused_while_suspended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let hv = QemuHypervisor::with_library_dir(tmp.path().to_path_buf()).expect("build hv");
+        let (id, _tag) = persist_suspended(&hv, "Sleeper", "sleeper").await;
+
+        let config = hv.get_config(&id).await.unwrap();
+        let err = hv
+            .start(&config)
+            .await
+            .expect_err("a cold start of a suspended VM must fail");
+        match err {
+            Error::Config(m) => assert!(
+                m.contains("suspended"),
+                "expected a suspended-start refusal, got: {m}"
+            ),
+            other => panic!("expected Error::Config(suspended), got {other:?}"),
+        }
+        // Nothing was launched.
+        assert!(hv.running_state(&id).await.is_none());
+
+        // A suspended VM that never entered the registry lists as Defined (the
+        // "suspended" bool is derived at the IPC layer from the persisted field).
+        let all = hv.list_all().await.unwrap();
+        let summary = all.iter().find(|s| s.id.to_string() == id).unwrap();
+        assert_eq!(summary.state, VmState::Defined);
+        assert!(config.metadata.suspended_snapshot.is_some());
+    }
+
+    // ---- discard_suspend clears the field (escape hatch) ----
+    #[tokio::test]
+    async fn discard_suspend_clears_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let hv = QemuHypervisor::with_library_dir(tmp.path().to_path_buf()).expect("build hv");
+        let (id, _tag) = persist_suspended(&hv, "Discardee", "discardee").await;
+
+        // Sanity: it starts out suspended.
+        assert!(hv
+            .get_config(&id)
+            .await
+            .unwrap()
+            .metadata
+            .suspended_snapshot
+            .is_some());
+
+        hv.discard_suspend(&id).await.unwrap();
+
+        let cfg = hv.get_config(&id).await.unwrap();
+        assert!(
+            cfg.metadata.suspended_snapshot.is_none(),
+            "discard_suspend must clear suspended_snapshot"
+        );
+        // Idempotent: discarding again on a non-suspended VM is a no-op Ok.
+        hv.discard_suspend(&id).await.unwrap();
+
+        // Now a cold start is no longer refused on the suspended-state guard
+        // (it may still fail later for lack of a real QEMU, but NOT here).
+        let config = hv.get_config(&id).await.unwrap();
+        assert!(config.metadata.suspended_snapshot.is_none());
+    }
+
+    // ---- start_inner validates shared folders before spawn ----
+    #[tokio::test]
+    async fn start_rejects_missing_shared_folder_host_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let hv = QemuHypervisor::with_library_dir(tmp.path().to_path_buf()).expect("build hv");
+        let mut cfg = defined_config(Uuid::new_v4(), "Sharer", "sharer");
+        // A safe-but-nonexistent absolute host path → validate_shared_folders
+        // must reject BEFORE any spawn attempt.
+        cfg.shared_folders = vec![crate::model::SharedFolder {
+            host_path: tmp.path().join("does-not-exist").display().to_string(),
+            mount_tag: "share".into(),
+            read_only: false,
+        }];
+        let vm = hv.create_vm(cfg).await.unwrap();
+        let config = hv.get_config(&vm.id.to_string()).await.unwrap();
+
+        let err = hv
+            .start(&config)
+            .await
+            .expect_err("start must reject a missing shared-folder host path");
+        match err {
+            Error::Config(m) => assert!(
+                m.contains("host path is not an existing directory"),
+                "expected a missing-dir share error, got: {m}"
+            ),
+            other => panic!("expected Error::Config(missing dir), got {other:?}"),
+        }
+        assert!(hv.running_state(&vm.id.to_string()).await.is_none());
     }
 }
