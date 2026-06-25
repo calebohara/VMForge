@@ -86,16 +86,17 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # --- Updater signing (D5/D8). Placeholders until a keypair exists. ---
+          # --- Updater signing (active). Private key is the repo secret; the
+          #     public key is in tauri.conf.json (plugins.updater.pubkey). ---
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # --- macOS Developer-ID signing + notarization (CI-only, D4). ---
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # NOTE: the macOS Developer-ID / notarization env vars (APPLE_CERTIFICATE,
+          # APPLE_SIGNING_IDENTITY, APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID) are
+          # intentionally OMITTED. tauri-action treats a defined-but-empty
+          # APPLE_CERTIFICATE as "sign me" and runs `security import` on an empty
+          # cert, which FAILS the macOS build. With them absent, macOS bundles are
+          # ad-hoc signed (Gatekeeper right-click→Open). To enable real signing +
+          # notarization, add the APPLE_* repo secrets AND re-add them here.
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "VMForge ${{ github.ref_name }}"
