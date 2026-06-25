@@ -24,6 +24,7 @@ export interface HostCapabilities {
   hardware_accelerated: boolean;
   qemu_img: QemuBinary;
   system_binaries: QemuBinary[];
+  network: NetworkCapabilities;
   warnings: string[];
 }
 
@@ -46,6 +47,11 @@ export interface PortForward {
   host: number;
   guest: number;
   udp: boolean;
+  /**
+   * When true, the forward binds all interfaces (`0.0.0.0`), exposing the
+   * guest port to the LAN. Defaults to false (loopback-only, `127.0.0.1`).
+   */
+  expose_lan: boolean;
 }
 
 export interface Hardware {
@@ -117,6 +123,22 @@ export interface Snapshot {
 
 export type CloneKind = "full" | "linked";
 
+// ---- Phase 4 networking capability types (mirror serde, snake_case) ----
+
+export interface ModeCapability {
+  mode: NetworkMode;
+  available: boolean;
+  requires_elevation: boolean;
+  /** Empty when `available`; otherwise the per-OS needs-permission reason. */
+  reason: string;
+}
+
+export interface NetworkCapabilities {
+  modes: ModeCapability[];
+  /** True when forwards bind loopback by default (per-forward LAN opt-in). */
+  port_forward_loopback_only: boolean;
+}
+
 // ---- Phase 1 wrappers (kept) ----
 
 export const probeHost = () => invoke<HostCapabilities>("probe_host");
@@ -153,3 +175,8 @@ export const deleteSnapshot = (id: string, snapshot_id: string) =>
   invoke<void>("delete_snapshot", { id, snapshot_id });
 export const cloneVm = (id: string, new_name: string, linked: boolean) =>
   invoke<VmConfig>("clone_vm", { id, new_name, linked });
+
+// ---- Phase 4 networking capability wrapper ----
+
+export const networkCapabilities = () =>
+  invoke<NetworkCapabilities>("network_capabilities");

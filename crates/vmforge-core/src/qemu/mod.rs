@@ -4,6 +4,7 @@
 pub mod args;
 pub mod engine;
 pub mod firmware;
+pub mod net;
 pub mod process;
 pub mod qmp;
 

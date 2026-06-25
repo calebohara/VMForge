@@ -779,6 +779,7 @@ mod tests {
                     host: 2222,
                     guest: 22,
                     udp: false,
+                    expose_lan: false,
                 }],
             },
             display: Default::default(),

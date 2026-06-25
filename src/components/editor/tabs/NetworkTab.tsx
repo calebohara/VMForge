@@ -1,25 +1,29 @@
-import { NetworkModeField } from "@/components/common/NetworkModeField";
-import type { NetworkMode } from "@/lib/ipc";
+import { NetworkForm } from "@/components/common/NetworkForm";
+import type { NetworkConfig } from "@/lib/ipc";
 
 /**
- * Editor tab — network adapter mode. Bridged / host-only remain disabled with an
- * explanation (Phase 4).
+ * Editor tab — full network configuration (mode, MAC, NAT port forwards). Wraps
+ * the shared {@link NetworkForm}. Changes apply at next launch.
  */
 export function NetworkTab({
-  mode,
+  value,
   disabled,
   onChange,
+  onValidityChange,
 }: {
-  mode: NetworkMode;
+  value: NetworkConfig;
   disabled?: boolean;
-  onChange: (mode: NetworkMode) => void;
+  onChange: (next: NetworkConfig) => void;
+  onValidityChange?: (valid: boolean) => void;
 }) {
   return (
-    <NetworkModeField
-      id="edit-network-mode"
-      mode={mode}
+    <NetworkForm
+      idPrefix="edit-net"
+      variant="editor"
+      value={value}
       disabled={disabled}
       onChange={onChange}
+      onValidityChange={onValidityChange}
     />
   );
 }

@@ -23,8 +23,9 @@ import { ProcessorsTab } from "@/components/editor/tabs/ProcessorsTab";
 import { MemoryTab } from "@/components/editor/tabs/MemoryTab";
 import { NetworkTab } from "@/components/editor/tabs/NetworkTab";
 import { getVm, updateVm } from "@/lib/ipc";
-import type { NetworkMode, VmConfig, VmState } from "@/lib/ipc";
+import type { NetworkConfig, VmConfig, VmState } from "@/lib/ipc";
 import {
+  normalizeNetwork,
   validateCpus,
   validateMemoryMib,
   validateVmName,
@@ -34,7 +35,8 @@ interface EditorDraft {
   name: string;
   cpus: number;
   memoryMib: number;
-  mode: NetworkMode;
+  /** Full network config (A10): round-trips mode + MAC + port forwards. */
+  network: NetworkConfig;
   iso: string;
 }
 
@@ -43,7 +45,12 @@ function draftFromConfig(c: VmConfig): EditorDraft {
     name: c.name,
     cpus: c.hardware.cpus,
     memoryMib: c.hardware.memory_mib,
-    mode: c.network.mode,
+    // Deep-copy so editing the draft never mutates the loaded original.
+    network: {
+      mode: c.network.mode,
+      mac: c.network.mac,
+      port_forwards: c.network.port_forwards.map((pf) => ({ ...pf })),
+    },
     iso: c.iso ?? "",
   };
 }
@@ -79,6 +86,7 @@ export function HardwareEditorView({
 }) {
   const [original, setOriginal] = useState<VmConfig | null>(null);
   const [draft, setDraft] = useState<EditorDraft | null>(null);
+  const [networkValid, setNetworkValid] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -113,7 +121,7 @@ export function HardwareEditorView({
       base.name !== draft.name ||
       base.cpus !== draft.cpus ||
       base.memoryMib !== draft.memoryMib ||
-      base.mode !== draft.mode ||
+      JSON.stringify(base.network) !== JSON.stringify(draft.network) ||
       base.iso !== draft.iso
     );
   }, [original, draft]);
@@ -123,7 +131,8 @@ export function HardwareEditorView({
     draft != null &&
     nameError === null &&
     validateCpus(draft.cpus) === null &&
-    validateMemoryMib(draft.memoryMib) === null;
+    validateMemoryMib(draft.memoryMib) === null &&
+    networkValid;
 
   const discard = () => {
     if (original) setDraft(draftFromConfig(original));
@@ -138,7 +147,7 @@ export function HardwareEditorView({
       await updateVm(vmId, {
         name: draft.name.trim(),
         hardware: { cpus: draft.cpus, memory_mib: draft.memoryMib },
-        network: { mode: draft.mode, mac: null, port_forwards: [] },
+        network: normalizeNetwork(draft.network),
         iso: draft.iso.trim() ? draft.iso.trim() : null,
       });
       onSaved();
@@ -236,9 +245,10 @@ export function HardwareEditorView({
 
               <TabsContent value="network" className="pt-4">
                 <NetworkTab
-                  mode={draft.mode}
+                  value={draft.network}
                   disabled={locked}
-                  onChange={(mode) => patch({ mode })}
+                  onChange={(network) => patch({ network })}
+                  onValidityChange={setNetworkValid}
                 />
               </TabsContent>
             </Tabs>

@@ -164,6 +164,10 @@ pub struct PortForward {
     pub guest: u16,
     #[serde(default)]
     pub udp: bool,
+    /// When `true`, bind the host side to all interfaces (`0.0.0.0`) instead of
+    /// loopback (`127.0.0.1`). LAN exposure is per-forward opt-in (decision A9).
+    #[serde(default)]
+    pub expose_lan: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -291,10 +295,11 @@ mod tests {
             host: 2222,
             guest: 22,
             udp: false,
+            expose_lan: false,
         };
         assert_keys(
             &serde_json::to_value(&pf).unwrap(),
-            &["host", "guest", "udp"],
+            &["host", "guest", "udp", "expose_lan"],
         );
 
         // NetworkConfig (↔ NetworkDto) — embeds the kebab-case mode enum.

@@ -7,6 +7,7 @@
 //! needs no real QEMU installed.
 
 use crate::error::Result;
+use crate::model::NetworkMode;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
@@ -60,6 +61,28 @@ pub struct QemuBinary {
     pub version: Option<String>,
 }
 
+/// Whether a single network mode can be used on this host, and if not, why.
+/// `reason` is empty when `available == true`; otherwise it is the user-facing
+/// explanation shared with the launch-reject path (so the UI and the engine
+/// never disagree).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModeCapability {
+    pub mode: NetworkMode,
+    pub available: bool,
+    pub requires_elevation: bool,
+    /// Empty when `available`; otherwise the per-OS needs-permission reason.
+    pub reason: String,
+}
+
+/// The aggregate networking capability picture for this host. `modes` lists
+/// every mode VMForge knows about; `port_forward_loopback_only` documents that
+/// forwards bind loopback by default (per-forward LAN exposure is opt-in).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkCapabilities {
+    pub modes: Vec<ModeCapability>,
+    pub port_forward_loopback_only: bool,
+}
+
 /// Everything the UI needs to explain what this host can and can't do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostCapabilities {
@@ -76,6 +99,9 @@ pub struct HostCapabilities {
     pub qemu_img: QemuBinary,
     /// `qemu-system-*` binaries we probed (aarch64 + x86_64).
     pub system_binaries: Vec<QemuBinary>,
+    /// Per-mode networking capabilities (user available; bridged/host-only
+    /// gated behind elevated permissions in this build).
+    pub network: NetworkCapabilities,
     /// Honest, user-facing limitations to surface in the UI.
     pub warnings: Vec<String>,
 }
@@ -142,6 +168,8 @@ pub fn probe() -> Result<HostCapabilities> {
         );
     }
 
+    let network = probe_network(&os);
+
     Ok(HostCapabilities {
         os,
         arch,
@@ -150,8 +178,38 @@ pub fn probe() -> Result<HostCapabilities> {
         hardware_accelerated,
         qemu_img,
         system_binaries,
+        network,
         warnings,
     })
+}
+
+/// Probe networking capabilities for a host OS. User-mode NAT is always
+/// available with zero privileges; bridged and host-only are gated behind
+/// elevated permissions in this build (decision A2), so they are reported
+/// `available == false`, `requires_elevation == true`, with the shared per-OS
+/// reason (so the capability UI and the launch-reject path never drift). Port
+/// forwards bind loopback by default (`port_forward_loopback_only == true`).
+pub fn probe_network(os: &str) -> NetworkCapabilities {
+    let user = ModeCapability {
+        mode: NetworkMode::User,
+        available: true,
+        requires_elevation: false,
+        reason: String::new(),
+    };
+    let elevated = |mode: NetworkMode| ModeCapability {
+        mode,
+        available: false,
+        requires_elevation: true,
+        reason: crate::qemu::net::elevated_reason(mode, os),
+    };
+    NetworkCapabilities {
+        modes: vec![
+            user,
+            elevated(NetworkMode::Bridged),
+            elevated(NetworkMode::HostOnly),
+        ],
+        port_forward_loopback_only: true,
+    }
 }
 
 /// QEMU system-emulator binary name for a guest/host arch.
@@ -261,5 +319,53 @@ mod tests {
             Accelerator::Tcg
         );
         assert_eq!(pick_preferred("windows", &[]), Accelerator::Tcg);
+    }
+
+    // ---- (E.2) network capability shape ----
+    #[test]
+    fn network_caps_phase4_shape() {
+        let caps = probe_network("macos");
+        assert!(
+            caps.port_forward_loopback_only,
+            "forwards must bind loopback by default"
+        );
+        assert_eq!(caps.modes.len(), 3, "user + bridged + host-only");
+
+        let user = caps
+            .modes
+            .iter()
+            .find(|m| m.mode == NetworkMode::User)
+            .expect("user mode present");
+        assert!(user.available, "user mode is available");
+        assert!(!user.requires_elevation);
+        assert!(user.reason.is_empty(), "available mode has empty reason");
+
+        for mode in [NetworkMode::Bridged, NetworkMode::HostOnly] {
+            let m = caps
+                .modes
+                .iter()
+                .find(|m| m.mode == mode)
+                .unwrap_or_else(|| panic!("{mode:?} present"));
+            assert!(!m.available, "{mode:?} unavailable in this build");
+            assert!(m.requires_elevation, "{mode:?} requires elevation");
+            assert!(!m.reason.is_empty(), "{mode:?} reason non-empty");
+            assert!(
+                !m.reason.to_lowercase().contains("unsupported"),
+                "{mode:?} reason must not say 'unsupported': {}",
+                m.reason
+            );
+        }
+
+        // On macOS the bridged reason must mention vmnet (matches net.rs).
+        let bridged = caps
+            .modes
+            .iter()
+            .find(|m| m.mode == NetworkMode::Bridged)
+            .unwrap();
+        assert!(
+            bridged.reason.contains("vmnet"),
+            "macos bridged reason must mention vmnet: {}",
+            bridged.reason
+        );
     }
 }

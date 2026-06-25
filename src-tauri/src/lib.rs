@@ -29,6 +29,7 @@ pub fn run() {
         .manage(AppState { hv })
         .invoke_handler(tauri::generate_handler![
             commands::probe_host,
+            commands::network_capabilities,
             commands::create_vm,
             commands::list_vms,
             commands::get_vm,

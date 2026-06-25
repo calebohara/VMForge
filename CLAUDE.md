@@ -153,8 +153,11 @@ VMForge/
   live (QMP `snapshot-save`/`-delete` jobs) + offline (`qemu-img`) snapshots,
   disk-only restore (live RAM-restore deferred), full + linked clones with
   parent-protection. See [`docs/phase3-spec.md`](docs/phase3-spec.md).
-- **Phase 4 — Networking modes.** Bridged + host-only (elevated-permissions
-  flow), NAT port forwarding.
+- **Phase 4 — Networking modes.** ✅ NAT port-forwarding (full, localhost-bound
+  by default, `expose_lan` opt-in), per-VM MAC, and the bridged/host-only
+  abstraction + capability detection + "needs elevated permissions" UX
+  (privileged bring-up deferred — rejected at launch, never silent NAT
+  fallback). See [`docs/phase4-spec.md`](docs/phase4-spec.md).
 - **Phase 5 — Workstation niceties.** SPICE (clipboard, dynamic res, USB
   redirect), shared folders, drag-and-drop, snapshot-at-suspend.
 - **Phase 6 — Distribution.** Signed packaged builds, first-run QEMU dependency

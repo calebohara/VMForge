@@ -15,13 +15,14 @@ import { StepStorage } from "@/components/wizard/steps/StepStorage";
 import { StepNetwork } from "@/components/wizard/steps/StepNetwork";
 import { StepReview } from "@/components/wizard/steps/StepReview";
 import {
+  normalizeNetwork,
   validateCpus,
   validateDiskGib,
   validateMemoryMib,
   validateVmName,
 } from "@/lib/validation";
 import { createVm } from "@/lib/ipc";
-import type { CreateVmRequest, NetworkMode, VmConfig } from "@/lib/ipc";
+import type { CreateVmRequest, NetworkConfig, VmConfig } from "@/lib/ipc";
 
 interface WizardDraft {
   name: string;
@@ -29,7 +30,8 @@ interface WizardDraft {
   cpus: number;
   memoryMib: number;
   diskGib: number;
-  mode: NetworkMode;
+  /** Full network config (A10): mode + MAC + port forwards round-trip. */
+  network: NetworkConfig;
 }
 
 const INITIAL_DRAFT: WizardDraft = {
@@ -38,7 +40,7 @@ const INITIAL_DRAFT: WizardDraft = {
   cpus: 2,
   memoryMib: 2048,
   diskGib: 20,
-  mode: "user",
+  network: { mode: "user", mac: null, port_forwards: [] },
 };
 
 const STEPS = [
@@ -71,6 +73,7 @@ export function NewVmWizard({
 }) {
   const [draft, setDraft] = useState<WizardDraft>(INITIAL_DRAFT);
   const [stepIndex, setStepIndex] = useState(0);
+  const [networkValid, setNetworkValid] = useState(true);
   const [submitting, setSubmitting] = useState<null | "start" | "only">(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -89,10 +92,12 @@ export function NewVmWizard({
         );
       case "storage":
         return validateDiskGib(draft.diskGib) === null;
+      case "network":
+        return networkValid;
       default:
         return true;
     }
-  }, [stepIndex, draft]);
+  }, [stepIndex, draft, networkValid]);
 
   const isLast = stepIndex === STEPS.length - 1;
   const busy = submitting !== null;
@@ -105,7 +110,7 @@ export function NewVmWizard({
         name: draft.name.trim(),
         hardware: { cpus: draft.cpus, memory_mib: draft.memoryMib },
         disk_gib: draft.diskGib,
-        network: { mode: draft.mode, mac: null, port_forwards: [] },
+        network: normalizeNetwork(draft.network),
         iso: draft.iso.trim() ? draft.iso.trim() : null,
       };
       const config = await createVm(req);
@@ -158,8 +163,9 @@ export function NewVmWizard({
             )}
             {current.key === "network" && (
               <StepNetwork
-                mode={draft.mode}
-                onModeChange={(mode) => patch({ mode })}
+                value={draft.network}
+                onChange={(network) => patch({ network })}
+                onValidityChange={setNetworkValid}
               />
             )}
             {current.key === "review" && (
@@ -168,7 +174,7 @@ export function NewVmWizard({
                 cpus={draft.cpus}
                 memoryMib={draft.memoryMib}
                 diskGib={draft.diskGib}
-                mode={draft.mode}
+                network={draft.network}
                 iso={draft.iso.trim()}
               />
             )}
@@ -202,7 +208,7 @@ export function NewVmWizard({
             <div className="flex items-center gap-2">
               <Button
                 variant="outline"
-                disabled={busy}
+                disabled={busy || !networkValid}
                 onClick={() => void submit(false)}
               >
                 {submitting === "only" ? (
@@ -212,7 +218,10 @@ export function NewVmWizard({
                 )}
                 Create only
               </Button>
-              <Button disabled={busy} onClick={() => void submit(true)}>
+              <Button
+                disabled={busy || !networkValid}
+                onClick={() => void submit(true)}
+              >
                 {submitting === "start" ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
                 ) : (

@@ -29,6 +29,11 @@ pub struct QemuLaunch<'a> {
     /// VNC display number N → host port 5900 + N.
     pub vnc_display: u16,
     pub qmp: QmpEndpoint<'a>,
+    /// Pre-built `-netdev`/`-device` network fragments (from
+    /// [`crate::qemu::net::network_args`]). Spliced verbatim into the argv. The
+    /// engine builds (and validates) these BEFORE spawn so an unavailable mode
+    /// is rejected up front; `build_args` itself stays infallible.
+    pub network: Vec<String>,
 }
 
 /// Build the full QEMU argument vector (everything after the binary name).
@@ -99,20 +104,6 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
         flag("-boot", "order=dc".to_string());
     }
 
-    // Networking: user-mode NAT (MVP). Bridged/host-only land later
-    // (network-engineer). Port forwards apply in user mode.
-    let mut netdev = String::from("user,id=net0");
-    for pf in &l.config.network.port_forwards {
-        let proto = if pf.udp { "udp" } else { "tcp" };
-        netdev.push_str(&format!(",hostfwd={proto}::{}-:{}", pf.host, pf.guest));
-    }
-    flag("-netdev", netdev);
-    let nic = match &l.config.network.mac {
-        Some(mac) => format!("virtio-net-pci,netdev=net0,mac={mac}"),
-        None => "virtio-net-pci,netdev=net0".to_string(),
-    };
-    flag("-device", nic);
-
     // Graphics + input so the VNC console renders output and accepts clicks.
     // aarch64 `virt` has no default display adapter; x86 q35 has built-in VGA.
     if l.guest_arch == "aarch64" {
@@ -132,6 +123,13 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
         }
         QmpEndpoint::Tcp(port) => flag("-qmp", format!("tcp:127.0.0.1:{port},server=on,wait=off")),
     }
+
+    // Networking: pre-built `-netdev`/`-device` fragments. The engine builds and
+    // validates these via `qemu::net::network_args` BEFORE spawn (rejecting any
+    // unavailable mode), so `build_args` just splices them in and stays
+    // infallible. Port-forward binding + MAC handling live in that module.
+    // Appended after the closures release their borrow of `a`.
+    a.extend(l.network.iter().cloned());
 
     a
 }
@@ -186,6 +184,7 @@ mod tests {
             firmware: Some(Path::new("/fw/x.fd")),
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
+            network: vec![],
         });
         let joined = args.join(" ");
         assert!(
@@ -214,6 +213,7 @@ mod tests {
             firmware: Some(Path::new("/fw/x.fd")),
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
+            network: vec![],
         });
         assert_eq!(
             find_flag(&args, "-drive"),
@@ -232,9 +232,13 @@ mod tests {
             host: 2222,
             guest: 22,
             udp: false,
+            expose_lan: false,
         }];
         let disk = PathBuf::from("/vm/disk.qcow2");
         let sock = PathBuf::from("/vm/qmp.sock");
+        // Build real network fragments so the broadest arg set is exercised.
+        let network =
+            crate::qemu::net::network_args(&c.network, Accelerator::Hvf, "macos").unwrap();
         let args = build_args(&QemuLaunch {
             config: &c,
             accel: Accelerator::Hvf,
@@ -244,10 +248,17 @@ mod tests {
             firmware: Some(Path::new("/fw/x.fd")),
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
+            network,
         });
         assert!(
             !args.iter().any(|a| a == "-snapshot"),
             "build_args must never emit -snapshot: {args:?}"
+        );
+        // Audit: the hostfwd substring uses the loopback (127.0.0.1) form.
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("hostfwd=tcp:127.0.0.1:2222-:22"),
+            "hostfwd must use the 127.0.0.1 loopback form: {joined}"
         );
     }
 
@@ -265,6 +276,7 @@ mod tests {
             firmware: Some(Path::new("/fw/edk2-aarch64-code.fd")),
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
+            network: vec![],
         });
         assert_eq!(find_flag(&args, "-machine"), Some("virt"));
         assert_eq!(find_flag(&args, "-accel"), Some("hvf"));
@@ -292,6 +304,7 @@ mod tests {
             firmware: Some(Path::new("/fw/x.fd")),
             vnc_display: 0,
             qmp: QmpEndpoint::Tcp(4444),
+            network: vec![],
         });
         assert_eq!(find_flag(&args, "-cpu"), Some("cortex-a72"));
         assert_eq!(
@@ -315,6 +328,7 @@ mod tests {
             firmware: Some(Path::new("/fw/x.fd")),
             vnc_display: 2,
             qmp: QmpEndpoint::UnixSocket(&sock),
+            network: vec![],
         });
         let joined = args.join(" ");
         assert!(joined.contains("file=/iso/alpine.iso,if=virtio,media=cdrom,format=raw"));
@@ -323,14 +337,20 @@ mod tests {
 
     #[test]
     fn port_forwards_render_hostfwd() {
+        // Network fragments are now built by `qemu::net::network_args` and spliced
+        // into the argv. Port forwards bind loopback (127.0.0.1) by default
+        // (decision A1 — sanctioned migration from the old empty-host form).
         let mut c = cfg();
         c.network.port_forwards = vec![PortForward {
             host: 2222,
             guest: 22,
             udp: false,
+            expose_lan: false,
         }];
         let disk = PathBuf::from("/vm/disk.qcow2");
         let sock = PathBuf::from("/vm/qmp.sock");
+        let network =
+            crate::qemu::net::network_args(&c.network, Accelerator::Hvf, "macos").unwrap();
         let args = build_args(&QemuLaunch {
             config: &c,
             accel: Accelerator::Hvf,
@@ -340,10 +360,11 @@ mod tests {
             firmware: Some(Path::new("/fw/x.fd")),
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
+            network,
         });
         assert_eq!(
             find_flag(&args, "-netdev"),
-            Some("user,id=net0,hostfwd=tcp::2222-:22")
+            Some("user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22")
         );
     }
 }

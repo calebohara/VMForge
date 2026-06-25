@@ -57,6 +57,15 @@ cargo check --workspace
   `snapshot-save` on a booted guest). Adversarially reviewed; 10 confirmed
   findings fixed (snapshot TOCTOU/lost-update, a multi-disk regression, clone
   path-traversal hardening).
+- **Phase 4 (networking modes) — functional & verified.** NAT **port-forwarding**
+  (host→guest, **bound to `127.0.0.1` by default**, `expose_lan` opt-in for LAN),
+  per-VM **MAC** (validated, auto-generated), and the **bridged/host-only**
+  abstraction with host **capability detection** + a "needs elevated permissions"
+  UX — privileged bring-up deferred (rejected cleanly at launch, never a silent
+  NAT fallback). Verified by a gated real-host test (QEMU actually binds the
+  forwarded host port). Adversarially reviewed; 5 confirmed findings fixed
+  (a high-severity editor-lockout for privileged-mode VMs, MAC arg-injection
+  hardening, a port-cap validity inversion, TS↔Rust type-sync).
 
 Run the app with `npm run tauri dev`, then Browse to an ISO and **Create &
 start**. See [`CLAUDE.md`](CLAUDE.md) for architecture, conventions, pinned

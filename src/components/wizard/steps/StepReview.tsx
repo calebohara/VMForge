@@ -1,12 +1,16 @@
-import { Cpu, Disc, HardDrive, MemoryStick, Network, Tag } from "lucide-react";
+import {
+  Cpu,
+  Disc,
+  Fingerprint,
+  HardDrive,
+  MemoryStick,
+  Network,
+  Share2,
+  Tag,
+} from "lucide-react";
 import { basename, formatCpus, formatMemory } from "@/lib/format";
-import type { NetworkMode } from "@/lib/ipc";
-
-const NETWORK_LABELS: Record<NetworkMode, string> = {
-  user: "NAT (user mode)",
-  bridged: "Bridged",
-  "host-only": "Host-only",
-};
+import { NETWORK_MODE_LABELS } from "@/components/common/NetworkForm";
+import type { NetworkConfig } from "@/lib/ipc";
 
 interface ReviewRow {
   icon: React.ReactNode;
@@ -20,16 +24,26 @@ export function StepReview({
   cpus,
   memoryMib,
   diskGib,
-  mode,
+  network,
   iso,
 }: {
   name: string;
   cpus: number;
   memoryMib: number;
   diskGib: number;
-  mode: NetworkMode;
+  network: NetworkConfig;
   iso: string;
 }) {
+  const forwardCount = network.port_forwards.filter(
+    (pf) => Number.isInteger(pf.host) && Number.isInteger(pf.guest),
+  ).length;
+  const forwardLabel =
+    network.mode === "user"
+      ? forwardCount === 1
+        ? "1 forward"
+        : `${forwardCount} forwards`
+      : "—";
+
   const rows: ReviewRow[] = [
     { icon: <Tag className="h-4 w-4" />, label: "Name", value: name },
     {
@@ -50,7 +64,17 @@ export function StepReview({
     {
       icon: <Network className="h-4 w-4" />,
       label: "Network",
-      value: NETWORK_LABELS[mode],
+      value: NETWORK_MODE_LABELS[network.mode],
+    },
+    {
+      icon: <Fingerprint className="h-4 w-4" />,
+      label: "MAC",
+      value: network.mac && network.mac.trim() ? network.mac.trim() : "Auto",
+    },
+    {
+      icon: <Share2 className="h-4 w-4" />,
+      label: "Port forwards",
+      value: forwardLabel,
     },
     {
       icon: <Disc className="h-4 w-4" />,

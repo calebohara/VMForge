@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::State;
 use uuid::Uuid;
-use vmforge_core::host::{self, Accelerator, HostCapabilities};
+use vmforge_core::host::{self, Accelerator, HostCapabilities, NetworkCapabilities};
 use vmforge_core::model::{
     DiskSpec, Hardware, NetworkConfig, NetworkMode, PortForward, SnapshotNode, VmConfig, VmState,
 };
@@ -182,6 +182,15 @@ impl From<SnapshotNode> for SnapshotDto {
 #[tauri::command]
 pub async fn probe_host() -> Result<HostCapabilities, String> {
     host::probe().map_err(|e| e.to_string())
+}
+
+/// Per-mode networking capabilities (user available; bridged/host-only gated
+/// behind elevated permissions in this build). Drives the network-form mode
+/// picker; shares the per-OS reason with the launch-reject path so the UI and
+/// engine never disagree. Infallible probe, so no error mapping needed.
+#[tauri::command]
+pub async fn network_capabilities() -> Result<NetworkCapabilities, String> {
+    Ok(host::probe_network(std::env::consts::OS))
 }
 
 /// Persist a new VM (dir + `vmforge.toml` + qcow2). Does NOT launch.
@@ -462,6 +471,7 @@ mod tests {
     //! runtime. Runs under `cargo test -p vmforge` / `--workspace`.
     use super::*;
     use serde_json::{json, Value};
+    use vmforge_core::host::ModeCapability;
 
     fn keys(v: &Value) -> Vec<String> {
         let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
@@ -589,5 +599,54 @@ mod tests {
             serde_json::from_str(r#"{"name":"n2","hardware":{"cpus":4,"memory_mib":4096}}"#)
                 .unwrap();
         assert_eq!(update.hardware.cpus, 4);
+    }
+
+    #[test]
+    fn network_capabilities_wire_shape() {
+        let caps = NetworkCapabilities {
+            modes: vec![ModeCapability {
+                mode: NetworkMode::HostOnly,
+                available: false,
+                requires_elevation: true,
+                reason: "needs elevated permissions".into(),
+            }],
+            port_forward_loopback_only: true,
+        };
+        let v = serde_json::to_value(&caps).unwrap();
+        assert_eq!(keys(&v), ["modes", "port_forward_loopback_only"]);
+
+        let mode = &v["modes"][0];
+        assert_eq!(
+            keys(mode),
+            ["available", "mode", "reason", "requires_elevation"]
+        );
+        // NetworkMode is kebab-case on the wire.
+        assert_eq!(mode["mode"], json!("host-only"));
+    }
+
+    #[test]
+    fn port_forward_dto_carries_expose_lan() {
+        // `update_vm` reflects `expose_lan` automatically: the field rides on the
+        // model `PortForward` carried by `NetworkDto`. Round-trip in + out.
+        let net: NetworkDto = serde_json::from_str(
+            r#"{"mode":"user","mac":null,"port_forwards":[{"host":2222,"guest":22,"udp":false,"expose_lan":true}]}"#,
+        )
+        .unwrap();
+        assert!(net.port_forwards[0].expose_lan);
+
+        let v = serde_json::to_value(&net).unwrap();
+        assert_eq!(
+            keys(&v["port_forwards"][0]),
+            ["expose_lan", "guest", "host", "udp"]
+        );
+        assert_eq!(v["port_forwards"][0]["expose_lan"], json!(true));
+
+        // `expose_lan` is `#[serde(default)]` (additive, back-compat): a legacy
+        // forward without it parses with the loopback-only default (false).
+        let legacy: NetworkDto = serde_json::from_str(
+            r#"{"mode":"user","mac":null,"port_forwards":[{"host":8080,"guest":80}]}"#,
+        )
+        .unwrap();
+        assert!(!legacy.port_forwards[0].expose_lan);
     }
 }

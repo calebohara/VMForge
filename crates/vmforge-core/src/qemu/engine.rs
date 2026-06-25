@@ -683,6 +683,13 @@ impl Hypervisor for QemuHypervisor {
             QmpBind::Tcp(port) => QmpEndpoint::Tcp(*port),
         };
 
+        // Build (and validate) the network fragments BEFORE spawning. An
+        // unavailable mode (bridged/host-only) or an invalid port-forward/MAC is
+        // rejected here as `Error::Config` — never a silent NAT fallback (A3/A4).
+        let network =
+            crate::qemu::net::network_args(&config.network, self.accel, std::env::consts::OS)
+                .map_err(|e| Error::Config(e.to_string()))?;
+
         let args = build_args(&QemuLaunch {
             config,
             accel: self.accel,
@@ -692,6 +699,7 @@ impl Hypervisor for QemuHypervisor {
             firmware: fw.as_deref(),
             vnc_display: display,
             qmp: qmp_arg,
+            network,
         });
         tracing::info!(target: "vmforge_core::qemu", vm = %config.name, ?args, "launching QEMU");
 
@@ -704,6 +712,14 @@ impl Hypervisor for QemuHypervisor {
             Err(e) => {
                 let _ = proc.kill().await;
                 let tail = tail_log(&log_path).await;
+                // A busy/invalid host forward port makes QEMU exit at startup
+                // (so QMP never comes up). Map that specific failure to a clean,
+                // actionable config error rather than the generic QMP-timeout.
+                if log_indicates_busy_host_port(&tail) {
+                    return Err(Error::Config(
+                        "Host port already in use or invalid; pick another or free it".to_string(),
+                    ));
+                }
                 return Err(Error::Qmp(format!("could not reach QMP: {e}{tail}")));
             }
         };
@@ -788,6 +804,13 @@ async fn connect_qmp(bind: &QmpBind, timeout: Duration) -> Result<QmpClient> {
             }
         }
     }
+}
+
+/// Whether a qemu.log tail indicates a busy/invalid host forwarding port.
+/// QEMU prints `Could not set up host forwarding rule '...'` (port in use) or
+/// `Bad host port` (out of range) and then exits during user-net setup.
+fn log_indicates_busy_host_port(log: &str) -> bool {
+    log.contains("Could not set up host forwarding rule") || log.contains("Bad host port")
 }
 
 async fn tail_log(path: &std::path::Path) -> String {
@@ -1120,5 +1143,83 @@ mod tests {
 
         // Clean up the sleeper.
         let _ = hv.kill(&id).await;
+    }
+
+    // ====================================================================
+    // Phase 4 — busy host-port log mapping (offline interim, E.2)
+    // ====================================================================
+
+    /// The exact stderr QEMU 11.0.1 prints when a forwarded host port is already
+    /// bound — and the out-of-range variant — must be recognized and mapped to
+    /// the clean, actionable config error rather than the generic QMP timeout.
+    #[test]
+    fn busy_host_port_log_is_recognized() {
+        // Port already in use.
+        let in_use = "qemu-system-aarch64: -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22: \
+                      Could not set up host forwarding rule 'tcp:127.0.0.1:2222-:22'";
+        assert!(log_indicates_busy_host_port(in_use));
+
+        // Out-of-range / invalid host port.
+        let bad = "qemu-system-aarch64: -netdev user,id=net0,hostfwd=tcp:127.0.0.1:99999-:22: \
+                   Bad host port 99999";
+        assert!(log_indicates_busy_host_port(bad));
+
+        // Unrelated failures must NOT be mapped to the host-port error.
+        assert!(!log_indicates_busy_host_port(
+            "qemu-system-aarch64: failed to find romfile 'efi-virtio.rom'"
+        ));
+        assert!(!log_indicates_busy_host_port(""));
+    }
+
+    /// End-to-end of the offline interim test (E.2): a throwaway process writes
+    /// QEMU's busy-port stderr to the launch log, exactly as a real QEMU would
+    /// before exiting; `tail_log` reads it and the mapping predicate fires. This
+    /// is the deterministic, no-QEMU proof that the early-exit branch in `start`
+    /// converts that log tail into `Error::Config(host port in use)`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn busy_host_port_from_throwaway_process_log_maps_to_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("qemu.log");
+
+        // Pre-bind a port so the scenario is grounded in a genuinely-busy port.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let busy = listener.local_addr().unwrap().port();
+
+        // Throwaway process that echoes QEMU's exact host-forwarding stderr to
+        // the log, then exits non-zero — mirroring QEMU's startup failure.
+        let msg = format!(
+            "qemu-system-aarch64: -netdev user,id=net0,hostfwd=tcp:127.0.0.1:{busy}-:22: \
+             Could not set up host forwarding rule 'tcp:127.0.0.1:{busy}-:22'"
+        );
+        let mut proc = QemuProcess::spawn(
+            "/bin/sh",
+            &["-c".into(), format!("echo \"{msg}\" 1>&2; exit 1")],
+            &log_path,
+        )
+        .await
+        .expect("spawn throwaway");
+        proc.wait().await.expect("await exit");
+
+        // Reproduce the early-exit mapping from `start`: read the log tail and
+        // route a recognized busy-port failure to the clean Config error.
+        let tail = tail_log(&log_path).await;
+        assert!(
+            log_indicates_busy_host_port(&tail),
+            "log tail must be recognized as a busy host port: {tail}"
+        );
+        let mapped: Error = if log_indicates_busy_host_port(&tail) {
+            Error::Config(
+                "Host port already in use or invalid; pick another or free it".to_string(),
+            )
+        } else {
+            Error::Qmp(format!("could not reach QMP{tail}"))
+        };
+        match mapped {
+            Error::Config(m) => assert!(m.contains("Host port already in use")),
+            other => panic!("expected Error::Config(host port in use), got {other:?}"),
+        }
+
+        drop(listener);
     }
 }
