@@ -1,16 +1,21 @@
 # VMForge release workflow (spec §D, decisions D5/D6/D8).
 #
-# WIRED BUT NOT ACTIVATED at the secret level: the signing/notarization env
-# vars below reference repository secrets that do not exist yet. The workflow
-# is additive and OFF the PR path — ci.yml stays the PR gate (untouched). This
+# ACTIVE: a real updater keypair exists — the public key is in
+# tauri.conf.json (plugins.updater.pubkey) and the private key is the
+# TAURI_SIGNING_PRIVATE_KEY repo secret (password empty). The workflow is
+# additive and OFF the PR path — ci.yml stays the PR gate (untouched). This
 # only runs on `push` of a `v*` tag, so opening a PR never triggers it.
 #
-# What makes a release "real" (off-sandbox, one-time setup):
-#   1. `npm run updater:keygen` (or `tauri signer generate`) → paste the public
-#      key into `plugins.updater.pubkey` in tauri.conf.json; store the private
-#      key + password as the TAURI_SIGNING_* secrets below.
-#   2. Add the APPLE_* secrets for Developer-ID signing + notarization.
-#   3. Push a tag, e.g. `git tag v0.2.0 && git push origin v0.2.0`.
+# To cut a release: bump the version in package.json + src-tauri/tauri.conf.json,
+# commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`. CI builds + signs +
+# publishes the GitHub Release (installers + latest.json); installed apps then
+# auto-update from /releases/latest/download/latest.json.
+#
+# Optional hardening (not required for auto-update to work): add the APPLE_*
+# secrets for Developer-ID signing + notarization (otherwise the macOS app is
+# ad-hoc signed and triggers Gatekeeper on first open). Windows is unsigned
+# (SmartScreen) without a code-signing cert. The updater signature is separate
+# and works regardless.
 #
 # The `--config src-tauri/tauri.release.conf.json` arg patches
 # `bundle.createUpdaterArtifacts` to true ONLY for release builds; the base
@@ -95,7 +100,9 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "VMForge ${{ github.ref_name }}"
           releaseBody: "See the assets below to download and install this version."
-          releaseDraft: true
+          # Publish (not draft) so the updater endpoint
+          # /releases/latest/download/latest.json resolves immediately.
+          releaseDraft: false
           prerelease: false
           # Patch createUpdaterArtifacts true for release only (base stays false),
           # plus per-OS bundle selection from the matrix.

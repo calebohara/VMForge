@@ -68,9 +68,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "PLACEHOLDER_DO_NOT_USE_dW50cnVzdGVkIGNvbW1lbnQ6IFZNRm9yZ2UgcGxhY2Vob2xkZXIgcHVibGljIGtleQ==",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEREQjhEQzUwOUZBNURGMzgKUldRNDM2V2ZVTnk0M1hJaXVXbjRHQmxadWF5bWl0WmpXZFJWMFRWTXQ5NkFOaEJ3TERZMlV3OUIK",
       "endpoints": [
-        "https://github.com/OWNER/VMForge/releases/latest/download/latest.json"
+        "https://github.com/calebohara/VMForge/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"
