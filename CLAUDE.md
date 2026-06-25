@@ -164,8 +164,13 @@ VMForge/
   refused on aarch64+HVF where QMP `snapshot-load` crashes, works under TCG).
   SPICE / USB redirect / drag-and-drop deferred (not feasible in the webview/
   sandbox). See [`docs/phase5-spec.md`](docs/phase5-spec.md).
-- **Phase 6 — Distribution.** Signed packaged builds, first-run QEMU dependency
-  handling, auto-update.
+- **Phase 6 — Distribution.** ✅ (verifiable subset + config) macOS `.app`/`.dmg`
+  packaging (`tauri build`), the **D3 PATH fix** (resolve QEMU to an absolute
+  path for probe/firmware/spawn — a Finder-launched `.app` has an empty PATH and
+  would otherwise never find Homebrew QEMU), first-run **QEMU-required gate** +
+  "Locate QEMU…" override, and signing/notarization + auto-update + a 3-OS
+  release CI workflow written **as code but inert** (need certs/keys/a release
+  host). See [`docs/phase6-spec.md`](docs/phase6-spec.md).
 
 ## Agent team (`.claude/agents/`)
 

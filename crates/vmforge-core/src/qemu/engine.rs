@@ -657,8 +657,20 @@ impl QemuHypervisor {
             .ok_or_else(|| Error::Other("no free VNC port (5901-5963)".into()))?;
         let vnc_port = 5900 + display;
 
+        // Resolve QEMU to an ABSOLUTE path once (D3). A Finder-launched `.app`
+        // inherits an empty `PATH`, so spawning the bare name would fail even
+        // though QEMU is installed — resolve here and spawn by absolute path.
+        let bin_name = host::system_binary(&self.host_arch);
+        let bin = crate::qemu_resolve::resolve_qemu_binary(bin_name).ok_or_else(|| {
+            Error::QemuNotFound(format!(
+                "{bin_name} not found on PATH or in the known QEMU install locations; install QEMU or set its location in settings"
+            ))
+        })?;
+        // The resolved bin dir, prepended to the child's PATH env so QEMU can
+        // find any sibling helpers under the same prefix.
+        let bin_dir = bin.parent().map(std::path::Path::to_path_buf);
+
         // aarch64 needs UEFI firmware; x86 uses built-in SeaBIOS.
-        let bin = host::system_binary(&self.host_arch).to_string();
         let fw = if self.host_arch == "aarch64" {
             let f = firmware::find_aarch64_uefi(&bin).ok_or_else(|| {
                 Error::Other(
@@ -728,7 +740,7 @@ impl QemuHypervisor {
         });
         tracing::info!(target: "vmforge_core::qemu", vm = %config.name, ?args, "launching QEMU");
 
-        let mut proc = QemuProcess::spawn(&bin, &args, &log_path).await?;
+        let mut proc = QemuProcess::spawn(&bin, &args, &log_path, bin_dir.as_deref()).await?;
 
         // Connect QMP (the server appears shortly after spawn). Kill QEMU and
         // surface its log tail if we can't reach it.
@@ -1142,9 +1154,14 @@ mod tests {
 
         // Spawn a process that exits immediately (portable `sh -c 'exit 0'`).
         let log = tmp.path().join("proc.log");
-        let mut proc = QemuProcess::spawn("/bin/sh", &["-c".into(), "exit 0".into()], &log)
-            .await
-            .expect("spawn sh");
+        let mut proc = QemuProcess::spawn(
+            std::path::Path::new("/bin/sh"),
+            &["-c".into(), "exit 0".into()],
+            &log,
+            None,
+        )
+        .await
+        .expect("spawn sh");
         // Wait for it to actually exit so try_wait reports Some.
         proc.wait().await.expect("await exit");
 
@@ -1359,9 +1376,14 @@ mod tests {
         // Insert a registry entry whose process stays alive (so the reaper sees
         // it running) with a dummy QMP (query fails → falls back to Running).
         let log = tmp.path().join("proc.log");
-        let proc = QemuProcess::spawn("/bin/sh", &["-c".into(), "sleep 30".into()], &log)
-            .await
-            .expect("spawn sleeper");
+        let proc = QemuProcess::spawn(
+            std::path::Path::new("/bin/sh"),
+            &["-c".into(), "sleep 30".into()],
+            &log,
+            None,
+        )
+        .await
+        .expect("spawn sleeper");
         hv.running.lock().await.insert(
             id.clone(),
             Arc::new(RunningVm {
@@ -1434,9 +1456,10 @@ mod tests {
              Could not set up host forwarding rule 'tcp:127.0.0.1:{busy}-:22'"
         );
         let mut proc = QemuProcess::spawn(
-            "/bin/sh",
+            std::path::Path::new("/bin/sh"),
             &["-c".into(), format!("echo \"{msg}\" 1>&2; exit 1")],
             &log_path,
+            None,
         )
         .await
         .expect("spawn throwaway");

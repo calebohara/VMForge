@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  VMForge hardened-runtime entitlements (Phase 6, decision D2).
+
+  Minimal by design. VMForge is an arm's-length manager: it spawns the
+  system QEMU as a separate, independently-signed process and never runs
+  guest/JIT code in its own address space. So it needs only:
+
+    * network.client / network.server — the noVNC websockify bridge
+      (ws://127.0.0.1:*) and the updater's HTTPS check.
+    * files.user-selected.read-write — ISO / disk-image / shared-folder
+      pickers.
+
+  Deliberately NOT included (these belong to a FUTURE bundled-QEMU phase,
+  not to VMForge itself — TCG's MAP_JIT happens inside the QEMU child, which
+  carries its own signing identity + com.apple.security.hypervisor):
+    * com.apple.security.cs.allow-jit
+    * com.apple.security.cs.disable-library-validation
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+</dict>
+</plist>

@@ -234,6 +234,29 @@ pub async fn network_capabilities() -> Result<NetworkCapabilities, String> {
     Ok(host::probe_network(std::env::consts::OS))
 }
 
+/// Persist the user's "Locate QEMU…" directory override (Phase 6 — D3).
+///
+/// The first-run gate's directory picker calls this with the chosen directory;
+/// it writes `qemu_dir` to the settings file consumed by
+/// `vmforge_core::qemu_resolve::resolve_qemu_binary`. The gate then re-invokes
+/// `probe_host` (no app restart) to pick up the new location. An empty/whitespace
+/// string clears the override (falls back to `$PATH` + install prefixes).
+///
+/// This is the only first-run-UX command: the resolver reads a settings file the
+/// webview cannot write cross-platform, so a thin IPC seam persists it (spec §C).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_qemu_dir(dir: String) -> Result<(), String> {
+    let trimmed = dir.trim();
+    let settings = vmforge_core::settings::Settings {
+        qemu_dir: if trimmed.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(trimmed))
+        },
+    };
+    vmforge_core::settings::save(&settings).map_err(|e| e.to_string())
+}
+
 /// Persist a new VM (dir + `vmforge.toml` + qcow2). Does NOT launch.
 #[tauri::command]
 pub async fn create_vm(

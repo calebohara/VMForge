@@ -26,10 +26,24 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // D5: register the (inert) updater + process plugins on desktop only.
+        // Mobile has no auto-update path. The updater is wired but not activated
+        // (createUpdaterArtifacts:false + placeholder pubkey), so check() just
+        // toasts until a real keypair + endpoint are configured for release.
+        .setup(|app| {
+            #[cfg(desktop)]
+            {
+                app.handle()
+                    .plugin(tauri_plugin_updater::Builder::new().build())?;
+                app.handle().plugin(tauri_plugin_process::init())?;
+            }
+            Ok(())
+        })
         .manage(AppState { hv })
         .invoke_handler(tauri::generate_handler![
             commands::probe_host,
             commands::network_capabilities,
+            commands::set_qemu_dir,
             commands::create_vm,
             commands::list_vms,
             commands::get_vm,

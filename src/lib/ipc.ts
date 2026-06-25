@@ -168,6 +168,14 @@ export interface NetworkCapabilities {
 // ---- Phase 1 wrappers (kept) ----
 
 export const probeHost = () => invoke<HostCapabilities>("probe_host");
+/**
+ * Persist the user's "Locate QEMU…" directory override (Phase 6 — D3). The
+ * first-run gate calls this with the picked directory, then re-probes (no app
+ * restart) so the resolver picks up the new location. An empty string clears
+ * the override.
+ */
+export const setQemuDir = (dir: string) =>
+  invoke<void>("set_qemu_dir", { dir });
 export const openConsole = (id: string) => invoke<number>("open_console", { id });
 export const vmState = (id: string) => invoke<VmState>("vm_state", { id });
 export const powerOff = (id: string) => invoke<void>("power_off", { id });

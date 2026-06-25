@@ -9,13 +9,22 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:build": "tauri build",
+    "tauri:build:mac": "tauri build --bundles app,dmg",
+    "tauri:build:mac:universal": "tauri build --target universal-apple-darwin --bundles app,dmg",
+    "tauri:build:win": "tauri build --bundles nsis",
+    "tauri:build:linux": "tauri build --bundles deb,appimage",
+    "tauri:build:debug": "tauri build --debug",
+    "updater:keygen": "tauri signer generate -w .tauri/updater.key"
   },
   "dependencies": {
     "@novnc/novnc": "^1.7.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-process": "^2",
+    "@tauri-apps/plugin-updater": "^2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^0.487.0",

@@ -1,0 +1,102 @@
+# VMForge release workflow (spec §D, decisions D5/D6/D8).
+#
+# WIRED BUT NOT ACTIVATED at the secret level: the signing/notarization env
+# vars below reference repository secrets that do not exist yet. The workflow
+# is additive and OFF the PR path — ci.yml stays the PR gate (untouched). This
+# only runs on `push` of a `v*` tag, so opening a PR never triggers it.
+#
+# What makes a release "real" (off-sandbox, one-time setup):
+#   1. `npm run updater:keygen` (or `tauri signer generate`) → paste the public
+#      key into `plugins.updater.pubkey` in tauri.conf.json; store the private
+#      key + password as the TAURI_SIGNING_* secrets below.
+#   2. Add the APPLE_* secrets for Developer-ID signing + notarization.
+#   3. Push a tag, e.g. `git tag v0.2.0 && git push origin v0.2.0`.
+#
+# The `--config src-tauri/tauri.release.conf.json` arg patches
+# `bundle.createUpdaterArtifacts` to true ONLY for release builds; the base
+# tauri.conf.json keeps it false so local/CI `tauri build` never tries to sign
+# update artifacts with the placeholder pubkey (which would fail the build).
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Required so tauri-action can create the draft GitHub Release + upload assets.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS Apple Silicon.
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin --bundles app,dmg,updater"
+          # macOS Intel.
+          - platform: macos-latest
+            args: "--target x86_64-apple-darwin --bundles app,dmg,updater"
+          # Linux (auto-update is manual download on Linux per D8, but we still
+          # publish deb + AppImage bundles).
+          - platform: ubuntu-22.04
+            args: "--bundles deb,appimage,updater"
+          # Windows.
+          - platform: windows-latest
+            args: "--bundles nsis,updater"
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system deps (Tauri 2)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libsoup-3.0-dev \
+            patchelf build-essential file
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Cross-arch macOS builds need both Apple targets available.
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # --- Updater signing (D5/D8). Placeholders until a keypair exists. ---
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # --- macOS Developer-ID signing + notarization (CI-only, D4). ---
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "VMForge ${{ github.ref_name }}"
+          releaseBody: "See the assets below to download and install this version."
+          releaseDraft: true
+          prerelease: false
+          # Patch createUpdaterArtifacts true for release only (base stays false),
+          # plus per-OS bundle selection from the matrix.
+          args: --config src-tauri/tauri.release.conf.json ${{ matrix.args }}

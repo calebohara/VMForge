@@ -5,10 +5,18 @@ use crate::error::{Error, Result};
 use serde::Deserialize;
 use std::path::Path;
 
-/// The `qemu-img` binary to invoke. Overridable via `VMFORGE_QEMU_IMG` so CI
-/// (and unit tests) can substitute a mock without a real QEMU install.
-fn qemu_img_bin() -> String {
-    std::env::var("VMFORGE_QEMU_IMG").unwrap_or_else(|_| "qemu-img".into())
+/// The `qemu-img` binary to invoke. `VMFORGE_QEMU_IMG` wins (CI/test mock seam);
+/// otherwise resolve to an ABSOLUTE path via the shared D3 resolver — same as
+/// the qemu-system path — so a Finder-launched `.app` with an empty inherited
+/// `PATH` (and any "Locate QEMU…" override) still finds qemu-img. Falls back to
+/// the bare name only if resolution fails.
+fn qemu_img_bin() -> std::ffi::OsString {
+    if let Some(v) = std::env::var_os("VMFORGE_QEMU_IMG") {
+        return v;
+    }
+    crate::qemu_resolve::resolve_qemu_binary("qemu-img")
+        .map(|p| p.into_os_string())
+        .unwrap_or_else(|| "qemu-img".into())
 }
 
 /// One internal qcow2 snapshot, as reported by
@@ -246,15 +254,24 @@ mod tests {
         assert_eq!(&contents, b"EXISTING", "existing disk must be untouched");
     }
 
-    // The env seam resolves the binary name. Serializes through the shared env
-    // guard because it mutates the process-global VMFORGE_QEMU_IMG.
+    // The env seam wins verbatim; otherwise qemu_img_bin resolves (D3) to an
+    // absolute path where qemu-img exists, falling back to the bare name. Either
+    // way the file name is "qemu-img". Serializes through the shared env guard
+    // because it mutates the process-global VMFORGE_QEMU_IMG.
     #[tokio::test]
     async fn qemu_img_bin_uses_env_seam() {
         let _g = crate::test_support::env_guard().await;
         std::env::set_var("VMFORGE_QEMU_IMG", "/opt/my-qemu-img");
-        assert_eq!(qemu_img_bin(), "/opt/my-qemu-img");
+        assert_eq!(qemu_img_bin(), std::ffi::OsString::from("/opt/my-qemu-img"));
         std::env::remove_var("VMFORGE_QEMU_IMG");
-        assert_eq!(qemu_img_bin(), "qemu-img");
+        let resolved = qemu_img_bin();
+        assert_eq!(
+            std::path::Path::new(&resolved)
+                .file_name()
+                .and_then(|s| s.to_str()),
+            Some("qemu-img"),
+            "resolved qemu-img path should end in 'qemu-img', got {resolved:?}"
+        );
     }
 
     // ---- pure argv builders (§E offline) ----

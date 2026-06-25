@@ -8,6 +8,7 @@
 
 use crate::error::Result;
 use crate::model::NetworkMode;
+use crate::qemu_resolve::resolve_qemu_binary;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
@@ -225,8 +226,15 @@ fn native_system_binary(arch: &str) -> String {
     system_binary(arch).to_string()
 }
 
+/// Probe a QEMU binary's version, resolving it to an absolute path first (D3).
+/// Resolving here — not invoking the bare name — is what makes the probe agree
+/// with the spawn path under a Finder-launched `.app` (empty inherited `PATH`).
 fn binary_version(bin: &str) -> Option<String> {
-    let out = Command::new(bin).arg("--version").output().ok()?;
+    let resolved = resolve_qemu_binary(bin)?;
+    let mut cmd = Command::new(&resolved);
+    cmd.arg("--version");
+    let out =
+        crate::qemu_resolve::output_with_timeout(&mut cmd, crate::qemu_resolve::PROBE_TIMEOUT)?;
     if !out.status.success() {
         return None;
     }
@@ -234,9 +242,14 @@ fn binary_version(bin: &str) -> Option<String> {
 }
 
 fn query_accelerators(bin: &str) -> Vec<Accelerator> {
-    match Command::new(bin).args(["-accel", "help"]).output() {
-        Ok(out) => parse_accelerators(&String::from_utf8_lossy(&out.stdout)),
-        Err(_) => Vec::new(),
+    let Some(resolved) = resolve_qemu_binary(bin) else {
+        return Vec::new();
+    };
+    let mut cmd = Command::new(&resolved);
+    cmd.args(["-accel", "help"]);
+    match crate::qemu_resolve::output_with_timeout(&mut cmd, crate::qemu_resolve::PROBE_TIMEOUT) {
+        Some(out) => parse_accelerators(&String::from_utf8_lossy(&out.stdout)),
+        None => Vec::new(),
     }
 }
 

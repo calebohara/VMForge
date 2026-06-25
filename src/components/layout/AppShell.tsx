@@ -1,8 +1,16 @@
-import { ChevronRight, MonitorCog } from "lucide-react";
+import { ArrowDownToLine, ChevronRight, MonitorCog, MoreVertical } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { AccelBadge } from "@/components/common/AccelBadge";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { checkForUpdates } from "@/lib/updater";
 import type { HostCapabilities } from "@/lib/ipc";
 
 export interface Crumb {
@@ -68,6 +76,25 @@ export function AppShell({
           {caps && (
             <AccelBadge accel={caps.preferred_accelerator} />
           )}
+
+          {/*
+            App-wide overflow menu. Currently just the (inert until activated,
+            spec §D / D5) "Check for updates…" affordance bound to
+            checkForUpdates(); lives here so it's reachable from every view,
+            including the first-run QEMU gate.
+          */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button size="icon-sm" variant="ghost" aria-label="More options">
+                <MoreVertical className="h-4 w-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={() => void checkForUpdates()}>
+                <ArrowDownToLine className="h-4 w-4" /> Check for updates…
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </header>
 
         <div className="flex min-h-0 flex-1 flex-col">{children}</div>

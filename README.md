@@ -77,6 +77,18 @@ cargo check --workspace
   (not feasible in the Tauri webview/sandbox). Adversarially reviewed; 5
   confirmed findings fixed (a missing `discard_suspend` IPC command, a
   resume-time vmstate leak, console nav-on-failure).
+- **Phase 6 (distribution, verifiable subset + config) — functional & verified.**
+  macOS `.app`/`.dmg` packaging; the **D3 PATH fix** — a Finder-launched `.app`
+  inherits an empty `PATH` and would never find Homebrew QEMU, so QEMU is
+  resolved to an absolute path for probe + firmware + spawn (with a "Locate
+  QEMU…" override); a first-run **QEMU-required gate**; and signing/notarization
+  + **auto-update** + a 3-OS release CI workflow written **as code but inert**
+  (need your certs/keys/release host). Verified: `tauri build` produces a valid
+  `VMForge.app`; gated real-host tests pass through the resolver. Adversarially
+  reviewed; 5 confirmed findings fixed (the headline: `qemu-img` bypassed the
+  resolver, breaking a Finder-launched app despite a passing gate). The macOS
+  `.dmg` window-layout step needs a GUI session (CI / a real desktop), not this
+  headless sandbox.
 
 Run the app with `npm run tauri dev`, then Browse to an ISO and **Create &
 start**. See [`CLAUDE.md`](CLAUDE.md) for architecture, conventions, pinned

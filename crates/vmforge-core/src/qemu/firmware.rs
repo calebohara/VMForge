@@ -5,16 +5,16 @@ use std::path::{Path, PathBuf};
 
 const AARCH64_CODE: &str = "edk2-aarch64-code.fd";
 
-/// Locate the aarch64 UEFI code blob. Searches near the QEMU binary, then a
-/// few well-known install prefixes. Returns `None` if not found.
-pub fn find_aarch64_uefi(qemu_system_bin: &str) -> Option<PathBuf> {
+/// Locate the aarch64 UEFI code blob. `qemu_bin` is the ALREADY-RESOLVED
+/// absolute QEMU binary path (D3) — derive `<prefix>/share/qemu` from it (no
+/// second resolve / `--version` spawn), then fall back to well-known install
+/// prefixes. Returns `None` if not found.
+pub fn find_aarch64_uefi(qemu_bin: &Path) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
 
-    // 1. <bin_dir>/../share/qemu (relative to the resolved binary).
-    if let Some(bin) = which(qemu_system_bin) {
-        if let Some(prefix) = bin.parent().and_then(Path::parent) {
-            dirs.push(prefix.join("share").join("qemu"));
-        }
+    // 1. <bin_dir>/../share/qemu, relative to the already-resolved binary.
+    if let Some(prefix) = qemu_bin.parent().and_then(Path::parent) {
+        dirs.push(prefix.join("share").join("qemu"));
     }
 
     // 2. Common locations (Homebrew, system, MSYS2).
@@ -32,21 +32,6 @@ pub fn find_aarch64_uefi(qemu_system_bin: &str) -> Option<PathBuf> {
         let f = d.join(AARCH64_CODE);
         if f.is_file() {
             return Some(f);
-        }
-    }
-    None
-}
-
-/// Minimal cross-platform `which`: first match for `bin` on `PATH`.
-fn which(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let exe_suffixes: &[&str] = if cfg!(windows) { &["", ".exe"] } else { &[""] };
-    for dir in std::env::split_paths(&path) {
-        for suffix in exe_suffixes {
-            let cand = dir.join(format!("{bin}{suffix}"));
-            if cand.is_file() {
-                return Some(cand);
-            }
         }
     }
     None

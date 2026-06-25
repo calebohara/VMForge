@@ -6,9 +6,12 @@ import { ConsoleView } from "@/components/console/ConsoleView";
 import { NewVmWizard } from "@/components/wizard/NewVmWizard";
 import { HardwareEditorView } from "@/components/editor/HardwareEditorView";
 import { SnapshotsView } from "@/components/snapshots/SnapshotsView";
+import { HostProbeLoading } from "@/components/host/HostProbeLoading";
+import { QemuRequiredGate } from "@/components/host/QemuRequiredGate";
 import type { VmActions } from "@/components/library/QuickActions";
 import { useHostCaps } from "@/hooks/useHostCaps";
 import { useVmLibrary } from "@/hooks/useVmLibrary";
+import { qemuMissing } from "@/lib/hostStatus";
 import * as ipc from "@/lib/ipc";
 import type { VmListItem, VmState } from "@/lib/ipc";
 
@@ -21,7 +24,14 @@ type View =
   | { kind: "console"; vmId: string; wsPort: number };
 
 function App() {
-  const { caps, hostCores } = useHostCaps();
+  const {
+    caps,
+    hostCores,
+    loading: capsLoading,
+    refreshing: capsRefreshing,
+    error: capsError,
+    refresh: refreshCaps,
+  } = useHostCaps();
   const { vms, loading, refresh } = useVmLibrary();
 
   const [view, setView] = useState<View>({ kind: "library" });
@@ -219,6 +229,27 @@ function App() {
         return [];
     }
   })();
+
+  // ---- First-run host gate (spec §C) ----
+  // Early-return BEFORE the view machine. The initial probe shows a loading
+  // screen; a host with no usable QEMU shows the hard gate inside AppShell
+  // (Re-check re-probes with no restart, falling through to the views once
+  // QEMU resolves). Otherwise the existing views render unchanged.
+  if (caps === null && capsLoading) {
+    return <HostProbeLoading />;
+  }
+  if (qemuMissing(caps)) {
+    return (
+      <AppShell caps={caps}>
+        <QemuRequiredGate
+          caps={caps!}
+          error={capsError}
+          rechecking={capsRefreshing}
+          onRecheck={refreshCaps}
+        />
+      </AppShell>
+    );
+  }
 
   return (
     <AppShell caps={caps} breadcrumbs={breadcrumbs}>

@@ -30,6 +30,8 @@ pub mod library;
 pub mod model;
 pub mod paths;
 pub mod qemu;
+pub mod qemu_resolve;
+pub mod settings;
 pub mod storage;
 
 pub use error::{Error, Result};

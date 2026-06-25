@@ -1,9 +1,9 @@
 import { useState } from "react";
-import { AlertTriangle, Cpu, MemoryStick, Plus } from "lucide-react";
+import { Cpu, MemoryStick, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { HostWarningsBanner } from "@/components/host/HostWarningsBanner";
 import { VmCard } from "@/components/library/VmCard";
 import { EmptyLibrary } from "@/components/library/EmptyLibrary";
 import { DeleteVmDialog } from "@/components/library/DeleteVmDialog";
@@ -85,17 +85,7 @@ export function LibraryView({
         </Button>
       </div>
 
-      {caps?.warnings && caps.warnings.length > 0 && (
-        <div className="space-y-2 px-5 pt-4">
-          {caps.warnings.map((w, i) => (
-            <Alert key={i} className="border-amber-500/30 bg-amber-500/10">
-              <AlertTriangle className="h-4 w-4 text-amber-500" />
-              <AlertTitle>Heads up</AlertTitle>
-              <AlertDescription>{w}</AlertDescription>
-            </Alert>
-          ))}
-        </div>
-      )}
+      <HostWarningsBanner caps={caps} />
 
       <ScrollArea className="min-h-0 flex-1">
         {loading ? (
