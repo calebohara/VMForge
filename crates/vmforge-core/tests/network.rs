@@ -62,6 +62,7 @@ async fn nat_port_forward_binds_host_port() {
         metadata: Default::default(),
         snapshots: Vec::new(),
         shared_folders: Vec::new(),
+        guest_arch: None,
     };
 
     let created = hv.create_vm(cfg).await.expect("create_vm");

@@ -100,6 +100,17 @@ separate nvm Node 24.14.0 (where `pnpm` lives). The project standardizes on
   (`build-engineer` + `qa-engineer` own a 3-OS matrix; a green build means all
   three pass, not just macOS). Never imply local macOS green == Win/Linux
   verified.
+- **Windows readiness (partial, honest).** `vmforge-core` now **cross-compiles
+  green to `x86_64-pc-windows-gnu`** from this host (mingw-w64 + the gnu target),
+  and the x86_64 guest path (qemu-system-x86_64 + OVMF pflash + TCG) is verified
+  by a gated real-host test on Apple Silicon. Guest arch is a create-time choice
+  (`VmConfig.guest_arch`; foreign arch ⇒ TCG, flagged emulated). The resolver,
+  firmware discovery, and QMP transport have real Windows branches. **Still
+  unverified on real Windows:** the Tauri shell (WebView2 packaging), WHPX
+  hardware accel, and a full Windows-guest boot — those need a Windows host / the
+  CI matrix. See [`docs/windows-readiness-spec.md`](docs/windows-readiness-spec.md).
+  Do not claim "runs on Windows" — claim "engine compiles for Windows; x86_64
+  guest path verified under emulation; full Windows run pending a Windows host."
 
 ## Accelerator selection (per-host, runtime)
 

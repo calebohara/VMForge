@@ -134,6 +134,27 @@ pub struct VmConfig {
     /// (additive, no schema bump).
     #[serde(default)]
     pub shared_folders: Vec<SharedFolder>,
+    /// Guest CPU architecture (`"x86_64"` | `"aarch64"`). Chosen at create time
+    /// and immutable thereafter (the installed OS arch is fixed to the disk).
+    /// `None` means "same as host" — older configs (pre-Windows-readiness) load
+    /// with `None` and behave exactly as before. A guest arch that differs from
+    /// the host forces TCG emulation (no HVF/WHPX/KVM for a foreign arch).
+    #[serde(default)]
+    pub guest_arch: Option<String>,
+}
+
+impl VmConfig {
+    /// The effective guest architecture: the explicit `guest_arch` if set,
+    /// otherwise the host architecture (back-compat for configs written before
+    /// the field existed). Empty strings are treated as unset.
+    pub fn effective_arch(&self, host_arch: &str) -> String {
+        self.guest_arch
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .unwrap_or(host_arch)
+            .to_string()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,10 +231,11 @@ pub struct VmSummary {
     pub id: VmId,
     pub name: String,
     pub state: VmState,
-    /// Accelerator this host will use (derived server-side, not persisted).
+    /// Accelerator this VM will use (derived server-side, not persisted).
+    /// Downgraded to `Tcg` when the guest arch differs from the host.
     pub accelerator: Accelerator,
-    /// Whether the guest arch differs from the host (emulated). Always
-    /// `false` in Phase 2 — no `guest_arch` field yet.
+    /// Whether the guest arch differs from the host (foreign-arch emulation
+    /// under TCG). Derived from `VmConfig::effective_arch` vs the host arch.
     pub emulated: bool,
 }
 

@@ -189,8 +189,10 @@ impl QmpClient {
 
     /// Test-only placeholder client backed by a closed/empty stream. Used to
     /// populate a registry entry whose process is checked via `try_wait`
-    /// (reaper) before any QMP I/O occurs. Never performs a handshake.
-    #[cfg(test)]
+    /// (reaper) before any QMP I/O occurs. Never performs a handshake. Only the
+    /// unix-gated engine reaper tests use it, so gate it to match (avoids a
+    /// dead-code warning on the Windows test build).
+    #[cfg(all(test, unix))]
     pub(crate) fn dummy() -> Self {
         Self {
             reader: BufReader::new(Box::new(tokio::io::empty())),

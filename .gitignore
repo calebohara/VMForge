@@ -23,6 +23,9 @@ pnpm-debug.log*
 /.vmforge-data
 *.qcow2
 *.sock
+# Stray qemu-img artifacts: a size arg ("2G") used as a relative output path
+# lands a 0-byte file in the crate root. Never commit these.
+/crates/vmforge-core/[0-9]*G
 
 # Editor / OS
 .vscode/*

@@ -168,6 +168,14 @@ pub fn probe() -> Result<HostCapabilities> {
             "Apple Silicon: ARM64 guests are HVF-accelerated; x86/x64 guests run under TCG emulation and will be slow.".to_string(),
         );
     }
+    // On Windows, WHPX being unavailable almost always means another component
+    // owns the hypervisor (Hyper-V / WSL2 / memory-integrity VBS). Name the
+    // usual cause instead of the generic TCG-fallback line (CLAUDE.md mandate).
+    if os == "windows" && !hardware_accelerated && system_binaries.iter().any(|b| b.present) {
+        warnings.push(
+            "Windows Hypervisor Platform (WHPX) is unavailable — usually because Hyper-V, WSL2, or memory-integrity (VBS) is holding the virtualization stack. Enable the Windows Hypervisor Platform feature for hardware acceleration; until then VMForge runs guests under TCG (slow).".to_string(),
+        );
+    }
 
     let network = probe_network(&os);
 

@@ -37,6 +37,7 @@ fn base_config(name: &str) -> VmConfig {
         metadata: Default::default(),
         snapshots: Vec::new(),
         shared_folders: Vec::new(),
+        guest_arch: None,
     }
 }
 

@@ -10,7 +10,7 @@ use crate::host::{self, Accelerator};
 use crate::hypervisor::Hypervisor;
 use crate::library::{self, Library};
 use crate::model::{Snapshot, SnapshotNode, VmConfig, VmId, VmState, VmSummary};
-use crate::qemu::args::{build_args, QemuLaunch, QmpEndpoint};
+use crate::qemu::args::{build_args, Firmware, QemuLaunch, QmpEndpoint};
 use crate::qemu::{firmware, process::QemuProcess, qmp::QmpClient};
 use async_trait::async_trait;
 use serde_json::json;
@@ -111,18 +111,34 @@ impl QemuHypervisor {
         Ok(port)
     }
 
+    /// Per-VM accelerator + emulation flag. A guest arch that differs from the
+    /// host can only run under TCG (emulated, slow — surfaced in the UI); a
+    /// native guest uses the host's preferred accelerator.
+    fn accel_for(&self, config: &VmConfig) -> (Accelerator, bool) {
+        let emulated = config.effective_arch(&self.host_arch) != self.host_arch;
+        let accel = if emulated {
+            Accelerator::Tcg
+        } else {
+            self.accel
+        };
+        (accel, emulated)
+    }
+
     /// Summaries of currently-running VMs.
     pub async fn list_running(&self) -> Vec<VmSummary> {
         self.running
             .lock()
             .await
             .values()
-            .map(|vm| VmSummary {
-                id: vm.config.id,
-                name: vm.config.name.clone(),
-                state: VmState::Running,
-                accelerator: self.accel,
-                emulated: false,
+            .map(|vm| {
+                let (accelerator, emulated) = self.accel_for(&vm.config);
+                VmSummary {
+                    id: vm.config.id,
+                    name: vm.config.name.clone(),
+                    state: VmState::Running,
+                    accelerator,
+                    emulated,
+                }
             })
             .collect()
     }
@@ -221,18 +237,20 @@ impl QemuHypervisor {
         // Single directory scan + parse.
         let configs = self.library.load_all().await?;
 
-        // Persisted VMs → Defined (accelerator/emulated filled here).
+        // Persisted VMs → Defined (accelerator/emulated filled here, per guest
+        // arch: a foreign-arch guest reports TCG + emulated).
         let mut by_id: HashMap<VmId, VmSummary> = configs
             .iter()
             .map(|c| {
+                let (accelerator, emulated) = self.accel_for(c);
                 (
                     c.id,
                     VmSummary {
                         id: c.id,
                         name: c.name.clone(),
                         state: VmState::Defined,
-                        accelerator: self.accel,
-                        emulated: false,
+                        accelerator,
+                        emulated,
                     },
                 )
             })
@@ -241,11 +259,15 @@ impl QemuHypervisor {
         // Overlay running state by id (reaps exited entries).
         let running = self.running_states().await;
         if !running.is_empty() {
-            // Build a lookup of running configs for names not in the library.
-            let live_names: HashMap<String, String> = {
+            // Build a lookup of running configs (name + per-arch accel/emulated)
+            // for VMs not in the library.
+            let live_meta: HashMap<String, (String, Accelerator, bool)> = {
                 let reg = self.running.lock().await;
                 reg.iter()
-                    .map(|(k, v)| (k.clone(), v.config.name.clone()))
+                    .map(|(k, v)| {
+                        let (accel, emulated) = self.accel_for(&v.config);
+                        (k.clone(), (v.config.name.clone(), accel, emulated))
+                    })
                     .collect()
             };
             for (id_str, state) in running {
@@ -256,18 +278,18 @@ impl QemuHypervisor {
                     Some(summary) => summary.state = state,
                     None => {
                         // Running but not persisted — include defensively.
-                        let name = live_names
+                        let (name, accelerator, emulated) = live_meta
                             .get(&id_str)
                             .cloned()
-                            .unwrap_or_else(|| id_str.clone());
+                            .unwrap_or_else(|| (id_str.clone(), self.accel, false));
                         by_id.insert(
                             id,
                             VmSummary {
                                 id,
                                 name,
                                 state,
-                                accelerator: self.accel,
-                                emulated: false,
+                                accelerator,
+                                emulated,
                             },
                         );
                     }
@@ -657,10 +679,31 @@ impl QemuHypervisor {
             .ok_or_else(|| Error::Other("no free VNC port (5901-5963)".into()))?;
         let vnc_port = 5900 + display;
 
-        // Resolve QEMU to an ABSOLUTE path once (D3). A Finder-launched `.app`
-        // inherits an empty `PATH`, so spawning the bare name would fail even
-        // though QEMU is installed — resolve here and spawn by absolute path.
-        let bin_name = host::system_binary(&self.host_arch);
+        // Guest architecture (create-time choice; defaults to host arch). A
+        // foreign arch can only run under TCG — HVF/WHPX/KVM cannot virtualize a
+        // CPU the host doesn't have — so downgrade the accelerator and mark it
+        // emulated (surfaced honestly in the UI).
+        let guest_arch = config.effective_arch(&self.host_arch);
+        // Defense-in-depth (the command layer also validates): reject an
+        // unsupported arch from a hand-edited/programmatic config with a clean
+        // error rather than silently mis-selecting the x86_64 emulator downstream.
+        if guest_arch != "x86_64" && guest_arch != "aarch64" {
+            return Err(Error::Config(format!(
+                "unsupported guest architecture '{guest_arch}' (expected x86_64 or aarch64)"
+            )));
+        }
+        let emulated = guest_arch != self.host_arch;
+        let accel = if emulated {
+            Accelerator::Tcg
+        } else {
+            self.accel
+        };
+
+        // Resolve QEMU to an ABSOLUTE path once (D3), picking the system emulator
+        // for the GUEST arch (so an x86_64 guest uses qemu-system-x86_64 even on
+        // an aarch64 host). A Finder-launched `.app` inherits an empty `PATH`, so
+        // spawning the bare name would fail even though QEMU is installed.
+        let bin_name = host::system_binary(&guest_arch);
         let bin = crate::qemu_resolve::resolve_qemu_binary(bin_name).ok_or_else(|| {
             Error::QemuNotFound(format!(
                 "{bin_name} not found on PATH or in the known QEMU install locations; install QEMU or set its location in settings"
@@ -670,18 +713,61 @@ impl QemuHypervisor {
         // find any sibling helpers under the same prefix.
         let bin_dir = bin.parent().map(std::path::Path::to_path_buf);
 
-        // aarch64 needs UEFI firmware; x86 uses built-in SeaBIOS.
-        let fw = if self.host_arch == "aarch64" {
-            let f = firmware::find_aarch64_uefi(&bin).ok_or_else(|| {
+        // Firmware (owned; borrowed into QemuLaunch below):
+        //  - aarch64 `virt`: required UEFI code blob via `-bios`.
+        //  - x86_64: OVMF (UEFI) when found — needed to boot Windows 11 — copying
+        //    the VARS template to a per-VM writable `OVMF_VARS.fd`; otherwise fall
+        //    back to built-in SeaBIOS (legacy boot; logged).
+        enum OwnedFirmware {
+            Bios(PathBuf),
+            Pflash { code: PathBuf, vars: PathBuf },
+        }
+        let owned_fw: Option<OwnedFirmware> = if guest_arch == "aarch64" {
+            let code = firmware::find_aarch64_uefi(&bin).ok_or_else(|| {
                 Error::Other(
                     "aarch64 UEFI firmware (edk2-aarch64-code.fd) not found; install QEMU firmware"
                         .into(),
                 )
             })?;
-            Some(f)
+            Some(OwnedFirmware::Bios(code))
         } else {
-            None
+            match firmware::find_x86_64_uefi(&bin) {
+                Some(x86) => {
+                    // NVRAM must be writable and per-VM — copy the template once.
+                    let vars_dest = vm_dir.join("OVMF_VARS.fd");
+                    if !vars_dest.exists() {
+                        tokio::fs::copy(&x86.vars_template, &vars_dest)
+                            .await
+                            .map_err(|e| {
+                                Error::Other(format!(
+                                    "failed to stage OVMF NVRAM {}: {e}",
+                                    vars_dest.display()
+                                ))
+                            })?;
+                        // `fs::copy` preserves the source mode bits, and many
+                        // distro OVMF VARS templates ship read-only — but pflash
+                        // unit 1 is opened read-write, so force the staged copy
+                        // writable or the UEFI guest won't boot.
+                        make_writable(&vars_dest).await?;
+                    }
+                    Some(OwnedFirmware::Pflash {
+                        code: x86.code,
+                        vars: vars_dest,
+                    })
+                }
+                None => {
+                    tracing::warn!(
+                        target: "vmforge_core::qemu",
+                        "x86_64 OVMF firmware not found; falling back to SeaBIOS (legacy BIOS). UEFI-only guests such as Windows 11 will not boot — install QEMU's edk2/OVMF firmware."
+                    );
+                    None
+                }
+            }
         };
+        let firmware = owned_fw.as_ref().map(|f| match f {
+            OwnedFirmware::Bios(code) => Firmware::Bios(code),
+            OwnedFirmware::Pflash { code, vars } => Firmware::Pflash { code, vars },
+        });
 
         let iso = config.iso.as_ref().map(PathBuf::from);
 
@@ -720,17 +806,16 @@ impl QemuHypervisor {
         // Build (and validate) the network fragments BEFORE spawning. An
         // unavailable mode (bridged/host-only) or an invalid port-forward/MAC is
         // rejected here as `Error::Config` — never a silent NAT fallback (A3/A4).
-        let network =
-            crate::qemu::net::network_args(&config.network, self.accel, std::env::consts::OS)
-                .map_err(|e| Error::Config(e.to_string()))?;
+        let network = crate::qemu::net::network_args(&config.network, accel, std::env::consts::OS)
+            .map_err(|e| Error::Config(e.to_string()))?;
 
         let args = build_args(&QemuLaunch {
             config,
-            accel: self.accel,
-            guest_arch: &self.host_arch,
+            accel,
+            guest_arch: &guest_arch,
             disk: &disk,
             iso: iso.as_deref(),
-            firmware: fw.as_deref(),
+            firmware,
             vnc_display: display,
             qmp: qmp_arg,
             network,
@@ -755,6 +840,14 @@ impl QemuHypervisor {
                 if log_indicates_busy_host_port(&tail) {
                     return Err(Error::Config(
                         "Host port already in use or invalid; pick another or free it".to_string(),
+                    ));
+                }
+                // A lost race for the QMP TCP loopback port (Windows; rare
+                // TOCTOU between our probe and QEMU's bind) → actionable retry,
+                // not an opaque 15 s QMP timeout.
+                if log_indicates_qmp_bind_failure(&tail) {
+                    return Err(Error::Config(
+                        "QMP control port was taken before launch; please try starting the VM again".to_string(),
                     ));
                 }
                 return Err(Error::Qmp(format!("could not reach QMP: {e}{tail}")));
@@ -813,15 +906,20 @@ impl QemuHypervisor {
     /// `aarch64 + HVF`, where QMP `snapshot-load` crashes (ORCHESTRATOR NOTE), so
     /// an unresumable vmstate is never captured. Single-disk only.
     pub async fn suspend(&self, id: &str) -> Result<()> {
+        let pre = self.get_config(id).await?;
+
         // Up-front accelerator gate: never capture a vmstate we cannot resume.
-        if self.host_arch == "aarch64" && self.accel.is_hardware() {
+        // QMP `snapshot-load` crashes under HVF on aarch64. This is keyed on the
+        // VM's EFFECTIVE accelerator: an emulated (foreign-arch) guest runs under
+        // TCG even on an aarch64 host, and suspend/resume works fine there.
+        let (accel, _) = self.accel_for(&pre);
+        if self.host_arch == "aarch64" && accel == Accelerator::Hvf {
             return Err(Error::Config(
                 "suspend/resume is unavailable with hardware acceleration (HVF) on this host"
                     .into(),
             ));
         }
 
-        let pre = self.get_config(id).await?;
         // Single-disk scope (the vmstate targets disk0).
         let _disk = self.single_disk_path(&pre).await?;
 
@@ -1027,6 +1125,25 @@ impl Hypervisor for QemuHypervisor {
     }
 }
 
+/// Force a file writable (clearing the read-only bit). Used to make a staged
+/// OVMF NVRAM copy writable even when the source template shipped read-only —
+/// `fs::copy` preserves mode bits and QEMU opens pflash unit 1 read-write.
+async fn make_writable(path: &std::path::Path) -> Result<()> {
+    let mut perms = tokio::fs::metadata(path).await?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(perms.mode() | 0o600);
+    }
+    #[cfg(not(unix))]
+    {
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+    }
+    tokio::fs::set_permissions(path, perms).await?;
+    Ok(())
+}
+
 /// First free VNC display in 1..64 (host port 5900 + N).
 fn find_free_vnc_display() -> Option<u16> {
     (1..64u16).find(|&d| TcpListener::bind(("127.0.0.1", 5900 + d)).is_ok())
@@ -1063,6 +1180,18 @@ async fn connect_qmp(bind: &QmpBind, timeout: Duration) -> Result<QmpClient> {
 /// `Bad host port` (out of range) and then exits during user-net setup.
 fn log_indicates_busy_host_port(log: &str) -> bool {
     log.contains("Could not set up host forwarding rule") || log.contains("Bad host port")
+}
+
+/// Whether a qemu.log tail indicates the QMP control port failed to bind — the
+/// TCP loopback port (Windows) was taken between our free-port probe and QEMU's
+/// own bind (a rare TOCTOU). QEMU echoes the failing `-qmp` option; on 11.x the
+/// TCP form reports `Failed to find an available port: Address already in use`,
+/// older/Unix forms `Failed to bind socket`. Requiring `-qmp` in the same tail
+/// avoids matching an unrelated `-netdev` hostfwd failure.
+fn log_indicates_qmp_bind_failure(log: &str) -> bool {
+    log.contains("-qmp")
+        && (log.contains("Failed to find an available port")
+            || log.contains("Failed to bind socket"))
 }
 
 async fn tail_log(path: &std::path::Path) -> String {
@@ -1110,7 +1239,30 @@ mod tests {
             metadata: Default::default(),
             snapshots: Vec::new(),
             shared_folders: Vec::new(),
+            guest_arch: None,
         }
+    }
+
+    #[test]
+    fn qmp_bind_failure_detector_matches_real_qemu_message() {
+        // The exact line qemu-system-* 11.x prints when the QMP TCP port is
+        // taken (reproduced on-host). Must be detected.
+        let tail = "qemu-system-x86_64: -qmp tcp:127.0.0.1:54321,server=on,wait=off: \
+             Failed to find an available port: Address already in use";
+        assert!(log_indicates_qmp_bind_failure(tail));
+        // Unix bind-socket variant too.
+        assert!(log_indicates_qmp_bind_failure(
+            "qemu-system-aarch64: -qmp unix:/x.sock: Failed to bind socket: Address already in use"
+        ));
+        // Must NOT false-positive on an unrelated hostfwd failure (no -qmp).
+        assert!(!log_indicates_qmp_bind_failure(
+            "qemu-system-x86_64: -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22: \
+             Could not set up host forwarding rule 'tcp:127.0.0.1:2222-:22'"
+        ));
+        // And the hostfwd detector still owns that case.
+        assert!(log_indicates_busy_host_port(
+            "Could not set up host forwarding rule 'tcp:127.0.0.1:2222-:22'"
+        ));
     }
 
     // ---- (18) list_all over empty registry → all Defined ----

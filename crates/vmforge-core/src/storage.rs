@@ -16,7 +16,15 @@ fn qemu_img_bin() -> std::ffi::OsString {
     }
     crate::qemu_resolve::resolve_qemu_binary("qemu-img")
         .map(|p| p.into_os_string())
-        .unwrap_or_else(|| "qemu-img".into())
+        // Last resort if resolution fully fails: the bare name. On Windows use
+        // the `.exe` form so `Command` finds it via CreateProcess search.
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "qemu-img.exe".into()
+            } else {
+                "qemu-img".into()
+            }
+        })
 }
 
 /// One internal qcow2 snapshot, as reported by

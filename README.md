@@ -90,6 +90,22 @@ cargo check --workspace
   `.dmg` window-layout step needs a GUI session (CI / a real desktop), not this
   headless sandbox.
 
+- **Windows readiness (engine verified; full app pending a Windows host).**
+  Closed the gaps a Windows-readiness audit found so VMForge can boot an x86_64
+  ISO — including a **UEFI Windows ISO**. New: **x86_64 OVMF firmware** discovery
+  + per-VM writable NVRAM (`-drive if=pflash` unit 0/1), a **guest-architecture
+  selector** (create-time; a foreign arch auto-downgrades to TCG and is flagged
+  "emulated" in the UI), broadened **Windows QEMU resolution** (`.exe`,
+  `%ProgramFiles%\qemu`, MSYS2/scoop/winget) + firmware discovery for the
+  qemu.org installer layout, a **WHPX/Hyper-V/VBS** fallback warning, and QMP
+  TCP bind-failure mapping. `vmforge-core` now **cross-compiles green to
+  `x86_64-pc-windows-gnu`**, and a gated real-host test boots an **x86_64 guest
+  under TCG with OVMF** end-to-end on Apple Silicon. Adversarially reviewed (9
+  confirmed findings fixed). Still unverified on real Windows: the Tauri shell
+  (WebView2 packaging), WHPX hardware accel, and a full Windows-guest boot —
+  these need a Windows host / the CI matrix. See
+  [`docs/windows-readiness-spec.md`](docs/windows-readiness-spec.md).
+
 Run the app with `npm run tauri dev`, then Browse to an ISO and **Create &
 start**. See [`CLAUDE.md`](CLAUDE.md) for architecture, conventions, pinned
 versions, the phased roadmap, and the agent team.

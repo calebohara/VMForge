@@ -16,6 +16,15 @@ pub enum QmpEndpoint<'a> {
     Tcp(u16),
 }
 
+/// Platform firmware for the guest.
+pub enum Firmware<'a> {
+    /// aarch64 `virt`: a single UEFI code blob passed via `-bios`.
+    Bios(&'a Path),
+    /// x86_64 OVMF (UEFI): a read-only CODE blob + a writable per-VM VARS file,
+    /// wired as two `-drive if=pflash` units. Required to boot Windows 11.
+    Pflash { code: &'a Path, vars: &'a Path },
+}
+
 /// Everything needed to construct a launch command line.
 pub struct QemuLaunch<'a> {
     pub config: &'a VmConfig,
@@ -24,8 +33,9 @@ pub struct QemuLaunch<'a> {
     pub guest_arch: &'a str,
     pub disk: &'a Path,
     pub iso: Option<&'a Path>,
-    /// aarch64 UEFI code blob (`edk2-aarch64-code.fd`); `None` for x86.
-    pub firmware: Option<&'a Path>,
+    /// Guest firmware: `Bios` (aarch64 UEFI code blob) or `Pflash` (x86 OVMF).
+    /// `None` means x86 SeaBIOS (built-in legacy BIOS — no firmware args).
+    pub firmware: Option<Firmware<'a>>,
     /// VNC display number N → host port 5900 + N.
     pub vnc_display: u16,
     pub qmp: QmpEndpoint<'a>,
@@ -82,9 +92,22 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
     flag("-smp", l.config.hardware.cpus.to_string());
     flag("-m", l.config.hardware.memory_mib.to_string());
 
-    // aarch64 `virt` has no built-in BIOS — UEFI firmware is required to boot.
-    if let Some(fw) = l.firmware {
-        flag("-bios", fw.display().to_string());
+    // Firmware. aarch64 `virt` has no built-in BIOS → `-bios <code>`. x86_64
+    // OVMF (UEFI, required by Windows 11) is two pflash units: read-only CODE +
+    // a writable per-VM VARS. `None` on x86 = built-in SeaBIOS (legacy boot).
+    match &l.firmware {
+        Some(Firmware::Bios(code)) => flag("-bios", code.display().to_string()),
+        Some(Firmware::Pflash { code, vars }) => {
+            flag(
+                "-drive",
+                format!("if=pflash,format=raw,unit=0,readonly=on,file={}", esc(code)),
+            );
+            flag(
+                "-drive",
+                format!("if=pflash,format=raw,unit=1,file={}", esc(vars)),
+            );
+        }
+        None => {}
     }
 
     // Boot disk (virtio-blk). `node-name=disk0` names the block node so live
@@ -190,6 +213,7 @@ mod tests {
             metadata: Default::default(),
             snapshots: Vec::new(),
             shared_folders: Vec::new(),
+            guest_arch: None,
         }
     }
 
@@ -214,7 +238,7 @@ mod tests {
             guest_arch: "aarch64",
             disk: &disk,
             iso: Some(Path::new("/isos/weird,name.iso")),
-            firmware: Some(Path::new("/fw/x.fd")),
+            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
             network: vec![],
@@ -244,7 +268,7 @@ mod tests {
             guest_arch: "aarch64",
             disk: &disk,
             iso: None,
-            firmware: Some(Path::new("/fw/x.fd")),
+            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
             network: vec![],
@@ -280,7 +304,7 @@ mod tests {
             guest_arch: "aarch64",
             disk: &disk,
             iso: Some(Path::new("/iso/alpine.iso")),
-            firmware: Some(Path::new("/fw/x.fd")),
+            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
             network,
@@ -309,7 +333,7 @@ mod tests {
             guest_arch: "aarch64",
             disk: &disk,
             iso: None,
-            firmware: Some(Path::new("/fw/edk2-aarch64-code.fd")),
+            firmware: Some(Firmware::Bios(Path::new("/fw/edk2-aarch64-code.fd"))),
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
             network: vec![],
@@ -338,7 +362,7 @@ mod tests {
             guest_arch: "aarch64",
             disk: &disk,
             iso: None,
-            firmware: Some(Path::new("/fw/x.fd")),
+            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
             vnc_display: 0,
             qmp: QmpEndpoint::Tcp(4444),
             network: vec![],
@@ -363,7 +387,7 @@ mod tests {
             guest_arch: "aarch64",
             disk: &disk,
             iso: Some(Path::new("/iso/alpine.iso")),
-            firmware: Some(Path::new("/fw/x.fd")),
+            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
             vnc_display: 2,
             qmp: QmpEndpoint::UnixSocket(&sock),
             network: vec![],
@@ -396,7 +420,7 @@ mod tests {
             guest_arch: "aarch64",
             disk: &disk,
             iso: None,
-            firmware: Some(Path::new("/fw/x.fd")),
+            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
             network,
@@ -425,7 +449,7 @@ mod tests {
             guest_arch: "aarch64",
             disk: &disk,
             iso: None,
-            firmware: Some(Path::new("/fw/x.fd")),
+            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
             network: vec![],
@@ -557,7 +581,7 @@ mod tests {
             guest_arch: "aarch64",
             disk: &disk,
             iso: Some(Path::new("/iso/alpine.iso")),
-            firmware: Some(Path::new("/fw/x.fd")),
+            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
             vnc_display: 1,
             qmp: QmpEndpoint::UnixSocket(&sock),
             network: vec![],
@@ -567,5 +591,78 @@ mod tests {
             !args.iter().any(|a| a == "-S"),
             "cold start must never emit -S: {args:?}"
         );
+    }
+
+    // ---- Windows-readiness: x86_64 firmware + machine ----
+
+    #[test]
+    fn x86_pflash_emits_two_pflash_drives() {
+        let c = cfg();
+        let disk = PathBuf::from("/vm/disk.qcow2");
+        let sock = PathBuf::from("/vm/qmp.sock");
+        let code = PathBuf::from("/fw/edk2-x86_64-code.fd");
+        let vars = PathBuf::from("/vm/OVMF_VARS.fd");
+        let args = build_args(&QemuLaunch {
+            config: &c,
+            accel: Accelerator::Tcg,
+            guest_arch: "x86_64",
+            disk: &disk,
+            iso: None,
+            firmware: Some(Firmware::Pflash {
+                code: &code,
+                vars: &vars,
+            }),
+            vnc_display: 1,
+            qmp: QmpEndpoint::UnixSocket(&sock),
+            network: vec![],
+            prelaunch: false,
+        });
+        let joined = args.join(" ");
+        assert_eq!(find_flag(&args, "-machine"), Some("q35"));
+        assert!(
+            joined.contains("if=pflash,format=raw,unit=0,readonly=on,file=/fw/edk2-x86_64-code.fd"),
+            "missing OVMF code pflash: {joined}"
+        );
+        assert!(
+            joined.contains("if=pflash,format=raw,unit=1,file=/vm/OVMF_VARS.fd"),
+            "missing OVMF vars pflash: {joined}"
+        );
+        // x86 OVMF must NOT use -bios, and q35 has built-in VGA (no virtio-gpu).
+        assert!(
+            find_flag(&args, "-bios").is_none(),
+            "x86 OVMF must not use -bios: {joined}"
+        );
+        assert!(
+            !joined.contains("virtio-gpu-pci"),
+            "x86 must not add a virtio-gpu device: {joined}"
+        );
+    }
+
+    #[test]
+    fn x86_no_firmware_falls_back_to_seabios() {
+        // No OVMF found → SeaBIOS: no -bios, no pflash. TCG x86 uses qemu64.
+        let c = cfg();
+        let disk = PathBuf::from("/vm/disk.qcow2");
+        let sock = PathBuf::from("/vm/qmp.sock");
+        let args = build_args(&QemuLaunch {
+            config: &c,
+            accel: Accelerator::Tcg,
+            guest_arch: "x86_64",
+            disk: &disk,
+            iso: None,
+            firmware: None,
+            vnc_display: 1,
+            qmp: QmpEndpoint::UnixSocket(&sock),
+            network: vec![],
+            prelaunch: false,
+        });
+        let joined = args.join(" ");
+        assert_eq!(find_flag(&args, "-machine"), Some("q35"));
+        assert!(find_flag(&args, "-bios").is_none());
+        assert!(
+            !joined.contains("if=pflash"),
+            "SeaBIOS fallback must emit no pflash: {joined}"
+        );
+        assert_eq!(find_flag(&args, "-cpu"), Some("qemu64"));
     }
 }

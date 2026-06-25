@@ -4,12 +4,14 @@ import {
   Fingerprint,
   HardDrive,
   MemoryStick,
+  MicrochipIcon,
   Network,
   Share2,
   Tag,
 } from "lucide-react";
 import { basename, formatCpus, formatMemory } from "@/lib/format";
 import { NETWORK_MODE_LABELS } from "@/components/common/NetworkForm";
+import { ARCH_LABELS } from "@/components/wizard/steps/StepBasics";
 import type { NetworkConfig } from "@/lib/ipc";
 
 interface ReviewRow {
@@ -21,6 +23,8 @@ interface ReviewRow {
 /** Step 5 — Review. A read-only summary of every choice before creating. */
 export function StepReview({
   name,
+  arch,
+  emulated,
   cpus,
   memoryMib,
   diskGib,
@@ -28,6 +32,8 @@ export function StepReview({
   iso,
 }: {
   name: string;
+  arch: string;
+  emulated: boolean;
   cpus: number;
   memoryMib: number;
   diskGib: number;
@@ -46,6 +52,11 @@ export function StepReview({
 
   const rows: ReviewRow[] = [
     { icon: <Tag className="h-4 w-4" />, label: "Name", value: name },
+    {
+      icon: <MicrochipIcon className="h-4 w-4" />,
+      label: "Architecture",
+      value: `${ARCH_LABELS[arch] ?? arch}${emulated ? " — emulated (TCG, slow)" : ""}`,
+    },
     {
       icon: <Cpu className="h-4 w-4" />,
       label: "Processors",

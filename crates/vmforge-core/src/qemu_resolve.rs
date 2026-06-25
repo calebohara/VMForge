@@ -98,23 +98,57 @@ fn env_path() -> Vec<PathBuf> {
     }
 }
 
-/// Hardcoded install prefixes (directories that hold QEMU binaries) per OS.
-/// These are the fallback for the empty-`PATH`-under-Finder case (D3).
+/// Install prefixes (directories that hold QEMU binaries) per OS. These are the
+/// fallback for the empty-`PATH` launch case (the macOS Finder D3 scenario, and
+/// the equivalent on a Windows GUI launch).
 fn default_prefixes() -> Vec<PathBuf> {
-    let raw: &[&str] = if cfg!(target_os = "macos") {
-        &["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"]
+    if cfg!(target_os = "macos") {
+        ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"]
+            .iter()
+            .map(PathBuf::from)
+            .collect()
     } else if cfg!(target_os = "windows") {
-        &[
-            r"C:\Program Files\qemu",
-            r"C:\Program Files (x86)\qemu",
-            r"C:\msys64\mingw64\bin",
-            r"C:\msys64\ucrt64\bin",
-        ]
+        windows_prefixes()
     } else {
         // Linux and other unix.
-        &["/usr/bin", "/usr/local/bin"]
+        ["/usr/bin", "/usr/local/bin"]
+            .iter()
+            .map(PathBuf::from)
+            .collect()
+    }
+}
+
+/// Windows QEMU install locations, derived from the environment so they hold
+/// regardless of system drive letter or user profile. Covers the official
+/// qemu.org installer (`%ProgramFiles%\qemu`), MSYS2, scoop, and winget shims.
+/// Reads only environment variables, so it compiles (and harmlessly returns the
+/// static MSYS2 entries) on non-Windows too.
+fn windows_prefixes() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let env_dir = |var: &str| {
+        std::env::var_os(var)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
     };
-    raw.iter().map(PathBuf::from).collect()
+
+    // Official qemu.org installer (and ARM64 build) land under Program Files.
+    for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        if let Some(p) = env_dir(var) {
+            dirs.push(p.join("qemu"));
+        }
+    }
+    // scoop (per-user) and winget shims.
+    if let Some(home) = env_dir("USERPROFILE") {
+        dirs.push(home.join("scoop").join("shims"));
+        dirs.push(home.join("scoop").join("apps").join("qemu").join("current"));
+    }
+    if let Some(local) = env_dir("LOCALAPPDATA") {
+        dirs.push(local.join("Microsoft").join("WinGet").join("Links"));
+    }
+    // MSYS2 default install roots.
+    dirs.push(PathBuf::from(r"C:\msys64\mingw64\bin"));
+    dirs.push(PathBuf::from(r"C:\msys64\ucrt64\bin"));
+    dirs
 }
 
 /// The seam: resolve `name` against an explicit override dir, `PATH` list, and
@@ -173,8 +207,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     /// Write a fake executable that prints a QEMU-ish version line and exits 0.
-    /// On non-unix this is a best-effort stub; the resolver tests below are
-    /// unix-gated so CI without `chmod` semantics is unaffected.
+    /// Used only by the unix-gated resolver tests (which rely on `chmod +x`).
+    #[cfg(unix)]
     fn write_fake_bin(dir: &Path, name: &str) -> PathBuf {
         fs::create_dir_all(dir).unwrap();
         let path = dir.join(name);
@@ -193,7 +227,8 @@ mod tests {
     }
 
     /// Write a 0-byte file (no exec bit) to model a placeholder that must be
-    /// rejected by the `--version` gate.
+    /// rejected by the `--version` gate. Used only by the unix-gated tests.
+    #[cfg(unix)]
     fn write_empty_file(dir: &Path, name: &str) -> PathBuf {
         fs::create_dir_all(dir).unwrap();
         let path = dir.join(name);
@@ -260,6 +295,39 @@ mod tests {
         let got = resolve_qemu_binary_with("qemu-img", None, vec![empty.clone()], &[empty]);
         assert_eq!(got, None);
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// On Windows, `candidate_in` must find `name.exe` when asked for the bare
+    /// `name` (a constructed absolute path does NOT consult PATHEXT, so the
+    /// resolver appends `.exe` itself). Tests the file-discovery branch without
+    /// needing a runnable binary (no `--version` here).
+    #[cfg(windows)]
+    #[test]
+    fn candidate_appends_exe_on_windows() {
+        let tmp = std::env::temp_dir().join(format!("vmforge-resolve-exe-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let exe = tmp.join("qemu-system-x86_64.exe");
+        fs::write(&exe, b"MZ").unwrap();
+        let got = candidate_in(&tmp, "qemu-system-x86_64");
+        assert_eq!(got.as_deref(), Some(exe.as_path()));
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn windows_prefixes_nonempty_and_cover_known_roots() {
+        // Pure env-derived; the MSYS2 statics are always present (env vars for
+        // Program Files / scoop may be absent when run off-Windows).
+        let dirs = windows_prefixes();
+        assert!(!dirs.is_empty());
+        let joined = dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(";");
+        assert!(
+            joined.contains("msys64"),
+            "expected an MSYS2 entry: {joined}"
+        );
     }
 
     #[cfg(unix)]

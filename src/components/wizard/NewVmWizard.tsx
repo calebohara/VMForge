@@ -27,6 +27,8 @@ import type { CreateVmRequest, NetworkConfig, VmConfig } from "@/lib/ipc";
 interface WizardDraft {
   name: string;
   iso: string;
+  /** Guest arch; "" means "use host arch" until the user picks one. */
+  guestArch: string;
   cpus: number;
   memoryMib: number;
   diskGib: number;
@@ -37,6 +39,7 @@ interface WizardDraft {
 const INITIAL_DRAFT: WizardDraft = {
   name: "",
   iso: "",
+  guestArch: "",
   cpus: 2,
   memoryMib: 2048,
   diskGib: 20,
@@ -60,10 +63,13 @@ const STEPS = [
  */
 export function NewVmWizard({
   hostCores,
+  hostArch,
   onCreated,
   onCancel,
 }: {
   hostCores: number | null;
+  /** Host CPU arch from the capability probe (drives the arch default). */
+  hostArch: string | null;
   /**
    * Called after a successful `create_vm`. `start` indicates the user chose
    * "Create & start" (the parent should start the VM and open its console).
@@ -112,6 +118,8 @@ export function NewVmWizard({
         disk_gib: draft.diskGib,
         network: normalizeNetwork(draft.network),
         iso: draft.iso.trim() ? draft.iso.trim() : null,
+        // Record the explicit guest arch (defaulting to the host's).
+        guest_arch: draft.guestArch || hostArch || null,
       };
       const config = await createVm(req);
       onCreated(config, start);
@@ -142,8 +150,11 @@ export function NewVmWizard({
               <StepBasics
                 name={draft.name}
                 iso={draft.iso}
+                guestArch={draft.guestArch}
+                hostArch={hostArch}
                 onNameChange={(name) => patch({ name })}
                 onIsoChange={(iso) => patch({ iso })}
+                onGuestArchChange={(guestArch) => patch({ guestArch })}
               />
             )}
             {current.key === "cpu" && (
@@ -171,6 +182,11 @@ export function NewVmWizard({
             {current.key === "review" && (
               <StepReview
                 name={draft.name.trim()}
+                arch={draft.guestArch || hostArch || "x86_64"}
+                emulated={
+                  hostArch != null &&
+                  (draft.guestArch || hostArch) !== hostArch
+                }
                 cpus={draft.cpus}
                 memoryMib={draft.memoryMib}
                 diskGib={draft.diskGib}
