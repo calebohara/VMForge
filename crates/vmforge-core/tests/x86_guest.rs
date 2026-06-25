@@ -34,7 +34,6 @@ fn x86_config(name: &str) -> VmConfig {
         metadata: Default::default(),
         snapshots: Vec::new(),
         shared_folders: Vec::new(),
-        guest_arch: Some("x86_64".into()),
     }
 }
 

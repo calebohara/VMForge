@@ -1,8 +1,19 @@
 # CLAUDE.md — VMForge
 
-VMForge is a cross-platform desktop app for creating, configuring, running,
-snapshotting, and managing virtual machines through a GUI — in the spirit of
-VMware Workstation Pro.
+VMForge is a **Windows** desktop app for creating, configuring, running,
+snapshotting, and managing **x86-64** virtual machines through a GUI — in the
+spirit of VMware Workstation Pro.
+
+> **WINDOWS-ONLY (x86-64).** VMForge was refocused from cross-platform to a
+> single supported target: **Windows on x86-64**. macOS/Linux host support, the
+> aarch64-guest path, HVF/KVM accelerators, and Unix-socket QMP have been
+> removed. Accelerator = **WHPX** (else **TCG**); QMP = **TCP loopback**;
+> machine = **q35** with **OVMF**/SeaBIOS firmware. The engine is still portable
+> Rust so it builds and unit-tests on the macOS dev box, but Windows is the only
+> platform that is shipped, packaged, and CI-gated. Historical sections below
+> may still mention three OSes — the authoritative current scope is
+> [`docs/windows-only-spec.md`](docs/windows-only-spec.md). Do not re-introduce
+> macOS/Linux/aarch64 code without an explicit decision to reverse this.
 
 ## What VMForge is (and is NOT)
 

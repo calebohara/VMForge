@@ -65,10 +65,6 @@ pub struct CreateVmRequest {
     pub network: Option<NetworkDto>,
     #[serde(default)]
     pub iso: Option<String>,
-    /// Guest CPU architecture (`"x86_64"` | `"aarch64"`). Omitted/empty = host
-    /// arch. A foreign arch boots under TCG emulation.
-    #[serde(default)]
-    pub guest_arch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,8 +89,6 @@ pub struct VmConfigDto {
     pub iso: Option<String>,
     pub shared_folders: Vec<SharedFolderDto>,
     pub suspended: bool,
-    /// Persisted guest arch (`None` = host arch). Read-only after create.
-    pub guest_arch: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,8 +102,6 @@ pub struct VmListItem {
     pub memory_mib: u32,
     pub iso: Option<String>,
     pub suspended: bool,
-    /// Persisted guest arch (`None` = host arch). For the library badge.
-    pub guest_arch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,7 +201,6 @@ impl From<VmConfig> for VmConfigDto {
                 .map(SharedFolderDto::from)
                 .collect(),
             suspended,
-            guest_arch: c.guest_arch,
         }
     }
 }
@@ -240,7 +231,7 @@ pub async fn probe_host() -> Result<HostCapabilities, String> {
 /// engine never disagree. Infallible probe, so no error mapping needed.
 #[tauri::command]
 pub async fn network_capabilities() -> Result<NetworkCapabilities, String> {
-    Ok(host::probe_network(std::env::consts::OS))
+    Ok(host::probe_network())
 }
 
 /// Persist the user's "Locate QEMU…" directory override (Phase 6 — D3).
@@ -272,23 +263,6 @@ pub async fn create_vm(
     state: State<'_, AppState>,
     req: CreateVmRequest,
 ) -> Result<VmConfigDto, String> {
-    // Validate the guest arch at the boundary: only the two architectures
-    // VMForge knows how to build. An unknown value would otherwise be silently
-    // treated as x86_64 downstream.
-    let guest_arch = req
-        .guest_arch
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    if let Some(a) = guest_arch {
-        if a != "x86_64" && a != "aarch64" {
-            return Err(format!(
-                "unsupported guest architecture '{a}' (expected x86_64 or aarch64)"
-            ));
-        }
-    }
-    let guest_arch = guest_arch.map(str::to_string);
-
     let config = VmConfig {
         id: Uuid::new_v4(),
         name: req.name,
@@ -310,7 +284,6 @@ pub async fn create_vm(
         metadata: Default::default(),
         snapshots: Vec::new(),
         shared_folders: Vec::new(),
-        guest_arch,
     };
     state
         .hv
@@ -350,7 +323,6 @@ pub async fn list_vms(state: State<'_, AppState>) -> Result<Vec<VmListItem>, Str
                 suspended: cfg
                     .map(|c| c.metadata.suspended_snapshot.is_some())
                     .unwrap_or(false),
-                guest_arch: cfg.and_then(|c| c.guest_arch.clone()),
             }
         })
         .collect();
@@ -613,13 +585,12 @@ mod tests {
             id: "id".into(),
             name: "n".into(),
             state: VmState::Running,
-            accelerator: Accelerator::Hvf,
+            accelerator: Accelerator::Whpx,
             emulated: false,
             cpus: 2,
             memory_mib: 2048,
             iso: None,
             suspended: false,
-            guest_arch: None,
         };
         let v = serde_json::to_value(&item).unwrap();
         assert_eq!(
@@ -628,7 +599,6 @@ mod tests {
                 "accelerator",
                 "cpus",
                 "emulated",
-                "guest_arch",
                 "id",
                 "iso",
                 "memory_mib",
@@ -638,7 +608,7 @@ mod tests {
             ]
         );
         assert_eq!(v["state"], json!("running")); // VmState lowercase
-        assert_eq!(v["accelerator"], json!("hvf")); // Accelerator lowercase
+        assert_eq!(v["accelerator"], json!("whpx")); // Accelerator lowercase
         assert_eq!(v["suspended"], json!(false)); // derived suspended-ness
     }
 
@@ -668,14 +638,12 @@ mod tests {
                 read_only: true,
             }],
             suspended: true,
-            guest_arch: Some("x86_64".into()),
         };
         let v = serde_json::to_value(&dto).unwrap();
         assert_eq!(
             keys(&v),
             [
                 "disks",
-                "guest_arch",
                 "hardware",
                 "id",
                 "iso",

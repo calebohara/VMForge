@@ -269,7 +269,6 @@ function App() {
       {view.kind === "wizard" && (
         <NewVmWizard
           hostCores={hostCores}
-          hostArch={caps?.arch ?? null}
           onCancel={backToLibrary}
           onCreated={(config, start) => {
             // Leave the wizard immediately so a later start/console failure

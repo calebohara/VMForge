@@ -2,10 +2,10 @@
 //!
 //! 1. 9p shared folder: a real QEMU launch ACCEPTS the -fsdev/-device 9p args
 //!    (a malformed pair would make QEMU exit before QMP, failing start) and the
-//!    suspend gate refuses on HVF.
-//! 2. Suspend/resume round-trip: forced under TCG (HVF cannot snapshot-load),
-//!    proving the engine's stop→snapshot-save→kill / relaunch -S→snapshot-load
-//!    →cont path end-to-end against real QEMU + qemu-img.
+//!    suspend gate refuses under hardware acceleration (WHPX).
+//! 2. Suspend/resume round-trip: forced under TCG (snapshot-load is only verified
+//!    under TCG), proving the engine's stop→snapshot-save→kill / relaunch
+//!    -S→snapshot-load→cont path end-to-end against real QEMU + qemu-img.
 //!
 //!   VMFORGE_REAL=1 cargo test -p vmforge-core --test phase5 -- --nocapture
 
@@ -37,7 +37,6 @@ fn base_config(name: &str) -> VmConfig {
         metadata: Default::default(),
         snapshots: Vec::new(),
         shared_folders: Vec::new(),
-        guest_arch: None,
     }
 }
 
@@ -76,12 +75,12 @@ async fn shared_folder_and_suspend_gate() {
         VmState::Running | VmState::Starting
     ));
 
-    // Suspend must be refused under HVF (accelerator gate).
-    if hv.accelerator() == Accelerator::Hvf {
+    // Suspend must be refused under hardware acceleration (WHPX).
+    if hv.accelerator().is_hardware() {
         let err = hv
             .suspend(&id)
             .await
-            .expect_err("suspend must refuse on HVF");
+            .expect_err("suspend must refuse under WHPX");
         assert!(
             err.to_string().contains("hardware acceleration"),
             "unexpected suspend error: {err}"
@@ -90,12 +89,13 @@ async fn shared_folder_and_suspend_gate() {
 
     hv.kill(&id).await.expect("kill");
     let _ = std::fs::remove_dir_all(&tmp);
-    eprintln!("OK: 9p share accepted by real QEMU; suspend gated on HVF");
+    eprintln!("OK: 9p share accepted by real QEMU; suspend gated under WHPX");
 }
 
 async fn suspend_resume_round_trip_tcg() {
     let tmp = std::env::temp_dir().join(format!("vmforge-suspend-it-{}", Uuid::new_v4()));
-    // Force TCG — HVF crashes on snapshot-load (the whole reason suspend is gated).
+    // Force TCG — snapshot-load is only verified under TCG (the reason suspend is
+    // gated off hardware acceleration).
     let hv = QemuHypervisor::with_library_dir_and_accel(tmp.clone(), Accelerator::Tcg).expect("hv");
 
     let created = hv
@@ -104,7 +104,7 @@ async fn suspend_resume_round_trip_tcg() {
         .expect("create_vm");
     let id = created.id.to_string();
     hv.start(&created).await.expect("start (tcg)");
-    // TCG aarch64 boot to the UEFI shell; give it a moment to reach running.
+    // TCG x86-64 boot to the UEFI shell; give it a moment to reach running.
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(hv.state(&id).await.expect("state"), VmState::Running);
 

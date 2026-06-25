@@ -134,27 +134,6 @@ pub struct VmConfig {
     /// (additive, no schema bump).
     #[serde(default)]
     pub shared_folders: Vec<SharedFolder>,
-    /// Guest CPU architecture (`"x86_64"` | `"aarch64"`). Chosen at create time
-    /// and immutable thereafter (the installed OS arch is fixed to the disk).
-    /// `None` means "same as host" — older configs (pre-Windows-readiness) load
-    /// with `None` and behave exactly as before. A guest arch that differs from
-    /// the host forces TCG emulation (no HVF/WHPX/KVM for a foreign arch).
-    #[serde(default)]
-    pub guest_arch: Option<String>,
-}
-
-impl VmConfig {
-    /// The effective guest architecture: the explicit `guest_arch` if set,
-    /// otherwise the host architecture (back-compat for configs written before
-    /// the field existed). Empty strings are treated as unset.
-    pub fn effective_arch(&self, host_arch: &str) -> String {
-        self.guest_arch
-            .as_deref()
-            .map(str::trim)
-            .filter(|a| !a.is_empty())
-            .unwrap_or(host_arch)
-            .to_string()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,11 +210,11 @@ pub struct VmSummary {
     pub id: VmId,
     pub name: String,
     pub state: VmState,
-    /// Accelerator this VM will use (derived server-side, not persisted).
-    /// Downgraded to `Tcg` when the guest arch differs from the host.
+    /// Accelerator this VM will use (derived server-side, not persisted): WHPX
+    /// when available, else TCG.
     pub accelerator: Accelerator,
-    /// Whether the guest arch differs from the host (foreign-arch emulation
-    /// under TCG). Derived from `VmConfig::effective_arch` vs the host arch.
+    /// Whether the VM runs under TCG software emulation (no WHPX) — the honest
+    /// "slow" indicator for the UI.
     pub emulated: bool,
 }
 
@@ -272,8 +251,10 @@ mod tests {
             serde_json::to_string(&NetworkMode::Bridged).unwrap(),
             "\"bridged\""
         );
-        assert_eq!(serde_json::to_string(&Accelerator::Hvf).unwrap(), "\"hvf\"");
-        assert_eq!(serde_json::to_string(&Accelerator::Kvm).unwrap(), "\"kvm\"");
+        assert_eq!(
+            serde_json::to_string(&Accelerator::Whpx).unwrap(),
+            "\"whpx\""
+        );
         assert_eq!(serde_json::to_string(&Accelerator::Tcg).unwrap(), "\"tcg\"");
     }
 
@@ -295,7 +276,10 @@ mod tests {
             serde_json::to_string(&NetworkMode::HostOnly).unwrap(),
             "\"host-only\""
         );
-        assert_eq!(serde_json::to_string(&Accelerator::Hvf).unwrap(), "\"hvf\"");
+        assert_eq!(
+            serde_json::to_string(&Accelerator::Whpx).unwrap(),
+            "\"whpx\""
+        );
 
         // Round-trip each enum (deserialize the wire string back).
         assert_eq!(
@@ -307,8 +291,8 @@ mod tests {
             NetworkMode::HostOnly
         );
         assert_eq!(
-            serde_json::from_str::<Accelerator>("\"hvf\"").unwrap(),
-            Accelerator::Hvf
+            serde_json::from_str::<Accelerator>("\"whpx\"").unwrap(),
+            Accelerator::Whpx
         );
 
         // Helper: assert an object has exactly `keys` (order-insensitive).
@@ -376,13 +360,13 @@ mod tests {
             id: Uuid::nil(),
             name: "x".into(),
             state: VmState::Running,
-            accelerator: Accelerator::Hvf,
+            accelerator: Accelerator::Whpx,
             emulated: false,
         };
         let sum_v = serde_json::to_value(&summary).unwrap();
         assert_keys(&sum_v, &["id", "name", "state", "accelerator", "emulated"]);
         assert_eq!(sum_v["state"], "running");
-        assert_eq!(sum_v["accelerator"], "hvf");
+        assert_eq!(sum_v["accelerator"], "whpx");
     }
 
     /// VmSummary serializes with exactly its snake_case field names.

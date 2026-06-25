@@ -1,37 +1,44 @@
 # VMForge
 
-A cross-platform desktop app for creating, configuring, running, snapshotting,
-and managing virtual machines through a GUI — in the spirit of VMware
+A **Windows** desktop app for creating, configuring, running, snapshotting, and
+managing **x86-64** virtual machines through a GUI — in the spirit of VMware
 Workstation Pro.
 
 VMForge is a **management/orchestration layer over QEMU**, not a hypervisor.
 QEMU does the virtualization; VMForge handles config, process supervision, a
-polished UI, and an embedded guest console. Think *virt-manager / UTM / GNOME
-Boxes*.
+polished UI, and an embedded guest console.
+
+> **Platform:** VMForge targets **Windows on x86-64** only. It uses **WHPX**
+> (Windows Hypervisor Platform) for acceleration, falling back to **TCG**
+> software emulation. The engine is portable Rust and can be built/unit-tested
+> on a unix dev box, but Windows is the only supported and shipped platform. See
+> [`docs/windows-only-spec.md`](docs/windows-only-spec.md).
 
 ## Stack
 
 - **Tauri 2** (Rust) shell — thin: window + IPC only.
 - **`vmforge-core`** (Rust crate) — the engine: `Hypervisor` trait, QEMU impl,
-  QMP client, process supervisor, disk/network/config managers.
+  QMP client (TCP loopback), process supervisor, disk/network/config managers.
 - **React + TypeScript + Tailwind v4 + shadcn/ui** frontend.
 - Drives **QEMU** via QMP (control), `qemu-img` (disks), and CLI args
-  (hardware). Console via VNC + noVNC (SPICE later).
+  (q35 + OVMF/SeaBIOS). Console via VNC + noVNC.
 
 ## Prerequisites
 
-- **QEMU** (`qemu-system-*`, `qemu-img`) — e.g. `brew install qemu`.
-- **Rust** ≥ 1.94, **Node** ≥ 20.19, **npm**.
-- macOS: Xcode Command Line Tools.
+- **Windows 10/11 (x86-64)** to run the app.
+- **QEMU for Windows** — install from <https://qemu.weilnetz.de> (lands in
+  `C:\Program Files\qemu`); VMForge auto-detects it (or use "Locate QEMU…").
+  Enable the **Windows Hypervisor Platform** feature for hardware acceleration.
+- **Rust** ≥ 1.94, **Node** ≥ 20.19, **npm** to build.
 
 ## Develop
 
 ```bash
 npm install
-npm run tauri dev            # run the app
-cargo test -p vmforge-core   # core tests (no VM needed)
+npm run tauri dev            # run the app (on Windows)
+cargo test -p vmforge-core   # core tests (run on a unix dev box; no VM needed)
 npm run build                # frontend build
-cargo check --workspace
+cargo build --workspace
 ```
 
 ## Status

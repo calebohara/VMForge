@@ -8,37 +8,28 @@ use crate::host::Accelerator;
 use crate::model::VmConfig;
 use std::path::Path;
 
-/// Where QEMU should expose its QMP control channel.
-pub enum QmpEndpoint<'a> {
-    /// Unix domain socket (macOS / Linux).
-    UnixSocket(&'a Path),
-    /// TCP loopback port (Windows; also usable anywhere).
-    Tcp(u16),
-}
+/// The QMP control channel: a TCP loopback port (`-qmp tcp:127.0.0.1:<port>`).
+pub struct QmpEndpoint(pub u16);
 
-/// Platform firmware for the guest.
-pub enum Firmware<'a> {
-    /// aarch64 `virt`: a single UEFI code blob passed via `-bios`.
-    Bios(&'a Path),
-    /// x86_64 OVMF (UEFI): a read-only CODE blob + a writable per-VM VARS file,
-    /// wired as two `-drive if=pflash` units. Required to boot Windows 11.
-    Pflash { code: &'a Path, vars: &'a Path },
+/// x86-64 OVMF (UEFI) firmware: a read-only CODE blob + a writable per-VM VARS
+/// file, wired as two `-drive if=pflash` units. Required to boot Windows. When
+/// [`QemuLaunch::firmware`] is `None`, the guest uses the built-in SeaBIOS.
+pub struct Firmware<'a> {
+    pub code: &'a Path,
+    pub vars: &'a Path,
 }
 
 /// Everything needed to construct a launch command line.
 pub struct QemuLaunch<'a> {
     pub config: &'a VmConfig,
     pub accel: Accelerator,
-    /// `"aarch64"` or `"x86_64"`.
-    pub guest_arch: &'a str,
     pub disk: &'a Path,
     pub iso: Option<&'a Path>,
-    /// Guest firmware: `Bios` (aarch64 UEFI code blob) or `Pflash` (x86 OVMF).
-    /// `None` means x86 SeaBIOS (built-in legacy BIOS — no firmware args).
+    /// x86-64 OVMF firmware, or `None` for the built-in SeaBIOS.
     pub firmware: Option<Firmware<'a>>,
     /// VNC display number N → host port 5900 + N.
     pub vnc_display: u16,
-    pub qmp: QmpEndpoint<'a>,
+    pub qmp: QmpEndpoint,
     /// Pre-built `-netdev`/`-device` network fragments (from
     /// [`crate::qemu::net::network_args`]). Spliced verbatim into the argv. The
     /// engine builds (and validates) these BEFORE spawn so an unavailable mode
@@ -65,49 +56,34 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
 
     flag("-name", l.config.name.clone());
 
-    // Machine + CPU model depend on guest arch and accelerator.
-    match l.guest_arch {
-        "aarch64" => {
-            flag("-machine", "virt".to_string());
-            // `-cpu host` requires hardware accel; TCG needs a concrete core.
-            let cpu = if l.accel == Accelerator::Hvf {
-                "host"
-            } else {
-                "cortex-a72"
-            };
-            flag("-cpu", cpu.to_string());
-        }
-        _ => {
-            flag("-machine", "q35".to_string());
-            let cpu = if l.accel.is_hardware() {
-                "host"
-            } else {
-                "qemu64"
-            };
-            flag("-cpu", cpu.to_string());
-        }
-    }
+    // x86-64 q35 machine. `-cpu host` needs hardware accel (WHPX); TCG needs a
+    // concrete model.
+    flag("-machine", "q35".to_string());
+    let cpu = if l.accel.is_hardware() {
+        "host"
+    } else {
+        "qemu64"
+    };
+    flag("-cpu", cpu.to_string());
 
     flag("-accel", l.accel.as_qemu_arg().to_string());
     flag("-smp", l.config.hardware.cpus.to_string());
     flag("-m", l.config.hardware.memory_mib.to_string());
 
-    // Firmware. aarch64 `virt` has no built-in BIOS → `-bios <code>`. x86_64
-    // OVMF (UEFI, required by Windows 11) is two pflash units: read-only CODE +
-    // a writable per-VM VARS. `None` on x86 = built-in SeaBIOS (legacy boot).
-    match &l.firmware {
-        Some(Firmware::Bios(code)) => flag("-bios", code.display().to_string()),
-        Some(Firmware::Pflash { code, vars }) => {
-            flag(
-                "-drive",
-                format!("if=pflash,format=raw,unit=0,readonly=on,file={}", esc(code)),
-            );
-            flag(
-                "-drive",
-                format!("if=pflash,format=raw,unit=1,file={}", esc(vars)),
-            );
-        }
-        None => {}
+    // Firmware: x86-64 OVMF (UEFI) is two pflash units — read-only CODE + a
+    // writable per-VM VARS. `None` = the built-in SeaBIOS (legacy BIOS boot).
+    if let Some(fw) = &l.firmware {
+        flag(
+            "-drive",
+            format!(
+                "if=pflash,format=raw,unit=0,readonly=on,file={}",
+                esc(fw.code)
+            ),
+        );
+        flag(
+            "-drive",
+            format!("if=pflash,format=raw,unit=1,file={}", esc(fw.vars)),
+        );
     }
 
     // Boot disk (virtio-blk). `node-name=disk0` names the block node so live
@@ -121,8 +97,7 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
         ),
     );
 
-    // Install media as a virtio CD-ROM. `-cdrom` defaults to if=ide, which the
-    // aarch64 `virt` machine does not have — so attach explicitly via virtio.
+    // Install media as a virtio CD-ROM.
     if let Some(iso) = l.iso {
         flag(
             "-drive",
@@ -131,11 +106,8 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
         flag("-boot", "order=dc".to_string());
     }
 
-    // Graphics + input so the VNC console renders output and accepts clicks.
-    // aarch64 `virt` has no default display adapter; x86 q35 has built-in VGA.
-    if l.guest_arch == "aarch64" {
-        flag("-device", "virtio-gpu-pci".to_string());
-    }
+    // Input devices for the VNC console (q35 has a built-in VGA adapter, so no
+    // explicit display device is needed).
     flag("-device", "qemu-xhci,id=usb".to_string());
     flag("-device", "usb-kbd".to_string());
     flag("-device", "usb-tablet".to_string());
@@ -143,13 +115,11 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
     // Display: built-in VNC server on loopback (noVNC bridge connects here).
     flag("-vnc", format!("127.0.0.1:{}", l.vnc_display));
 
-    // QMP control channel.
-    match &l.qmp {
-        QmpEndpoint::UnixSocket(p) => {
-            flag("-qmp", format!("unix:{},server=on,wait=off", p.display()))
-        }
-        QmpEndpoint::Tcp(port) => flag("-qmp", format!("tcp:127.0.0.1:{port},server=on,wait=off")),
-    }
+    // QMP control channel: TCP loopback.
+    flag(
+        "-qmp",
+        format!("tcp:127.0.0.1:{},server=on,wait=off", l.qmp.0),
+    );
 
     // virtio-9p shared folders (decision A): a two-part fragment per folder —
     // `-fsdev local,id=fsdevN,path=<host>,security_model=mapped-xattr[,readonly=on]`
@@ -192,7 +162,7 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Hardware, NetworkConfig, PortForward, VmConfig};
+    use crate::model::{Hardware, NetworkConfig, PortForward, SharedFolder, VmConfig};
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -213,8 +183,31 @@ mod tests {
             metadata: Default::default(),
             snapshots: Vec::new(),
             shared_folders: Vec::new(),
-            guest_arch: None,
         }
+    }
+
+    /// Build with a fixed VNC display (1) and QMP port (4444); disk defaults to
+    /// `/vm/disk.qcow2` unless overridden.
+    fn build(
+        c: &VmConfig,
+        accel: Accelerator,
+        disk: &Path,
+        iso: Option<&Path>,
+        firmware: Option<Firmware>,
+        network: Vec<String>,
+        prelaunch: bool,
+    ) -> Vec<String> {
+        build_args(&QemuLaunch {
+            config: c,
+            accel,
+            disk,
+            iso,
+            firmware,
+            vnc_display: 1,
+            qmp: QmpEndpoint(4444),
+            network,
+            prelaunch,
+        })
     }
 
     fn find_flag<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
@@ -226,24 +219,20 @@ mod tests {
 
     #[test]
     fn drive_paths_with_commas_are_escaped() {
-        // A comma in a path must be doubled so QEMU treats it as literal, not
-        // an option separator (injection guard for the user-chosen ISO path).
+        // A comma in a path must be doubled so QEMU treats it as literal, not an
+        // option separator (injection guard for the user-chosen ISO path).
         let mut c = cfg();
         c.iso = Some("/isos/weird,name.iso".into());
         let disk = PathBuf::from("/vm/di,sk.qcow2");
-        let sock = PathBuf::from("/vm/qmp.sock");
-        let args = build_args(&QemuLaunch {
-            config: &c,
-            accel: Accelerator::Hvf,
-            guest_arch: "aarch64",
-            disk: &disk,
-            iso: Some(Path::new("/isos/weird,name.iso")),
-            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
-            vnc_display: 1,
-            qmp: QmpEndpoint::UnixSocket(&sock),
-            network: vec![],
-            prelaunch: false,
-        });
+        let args = build(
+            &c,
+            Accelerator::Whpx,
+            &disk,
+            Some(Path::new("/isos/weird,name.iso")),
+            None,
+            vec![],
+            false,
+        );
         let joined = args.join(" ");
         assert!(
             joined.contains("file=/isos/weird,,name.iso,if=virtio,media=cdrom,format=raw"),
@@ -258,22 +247,10 @@ mod tests {
     #[test]
     fn boot_drive_has_node_name_disk0() {
         // Live QMP snapshot jobs target the named block node, so the boot
-        // -drive MUST carry node-name=disk0.
-        let c = cfg();
+        // -drive MUST carry node-name=disk0. With SeaBIOS (no pflash) the boot
+        // disk is the first -drive.
         let disk = PathBuf::from("/vm/disk.qcow2");
-        let sock = PathBuf::from("/vm/qmp.sock");
-        let args = build_args(&QemuLaunch {
-            config: &c,
-            accel: Accelerator::Hvf,
-            guest_arch: "aarch64",
-            disk: &disk,
-            iso: None,
-            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
-            vnc_display: 1,
-            qmp: QmpEndpoint::UnixSocket(&sock),
-            network: vec![],
-            prelaunch: false,
-        });
+        let args = build(&cfg(), Accelerator::Whpx, &disk, None, None, vec![], false);
         assert_eq!(
             find_flag(&args, "-drive"),
             Some("file=/vm/disk.qcow2,if=virtio,format=qcow2,node-name=disk0")
@@ -286,35 +263,28 @@ mod tests {
         // all disk writes on power-off. VMForge must NEVER emit it. Guard with
         // an ISO + port forwards present to exercise the broadest arg set.
         let mut c = cfg();
-        c.iso = Some("/iso/alpine.iso".into());
+        c.iso = Some("/iso/win.iso".into());
         c.network.port_forwards = vec![PortForward {
             host: 2222,
             guest: 22,
             udp: false,
             expose_lan: false,
         }];
+        let network = crate::qemu::net::network_args(&c.network, Accelerator::Whpx).unwrap();
         let disk = PathBuf::from("/vm/disk.qcow2");
-        let sock = PathBuf::from("/vm/qmp.sock");
-        // Build real network fragments so the broadest arg set is exercised.
-        let network =
-            crate::qemu::net::network_args(&c.network, Accelerator::Hvf, "macos").unwrap();
-        let args = build_args(&QemuLaunch {
-            config: &c,
-            accel: Accelerator::Hvf,
-            guest_arch: "aarch64",
-            disk: &disk,
-            iso: Some(Path::new("/iso/alpine.iso")),
-            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
-            vnc_display: 1,
-            qmp: QmpEndpoint::UnixSocket(&sock),
+        let args = build(
+            &c,
+            Accelerator::Whpx,
+            &disk,
+            Some(Path::new("/iso/win.iso")),
+            None,
             network,
-            prelaunch: false,
-        });
+            false,
+        );
         assert!(
             !args.iter().any(|a| a == "-snapshot"),
             "build_args must never emit -snapshot: {args:?}"
         );
-        // Audit: the hostfwd substring uses the loopback (127.0.0.1) form.
         let joined = args.join(" ");
         assert!(
             joined.contains("hostfwd=tcp:127.0.0.1:2222-:22"),
@@ -323,52 +293,15 @@ mod tests {
     }
 
     #[test]
-    fn aarch64_hvf_uses_host_cpu_and_virt() {
-        let c = cfg();
+    fn q35_whpx_uses_host_cpu_and_tcp_qmp() {
         let disk = PathBuf::from("/vm/disk.qcow2");
-        let sock = PathBuf::from("/vm/qmp.sock");
-        let args = build_args(&QemuLaunch {
-            config: &c,
-            accel: Accelerator::Hvf,
-            guest_arch: "aarch64",
-            disk: &disk,
-            iso: None,
-            firmware: Some(Firmware::Bios(Path::new("/fw/edk2-aarch64-code.fd"))),
-            vnc_display: 1,
-            qmp: QmpEndpoint::UnixSocket(&sock),
-            network: vec![],
-            prelaunch: false,
-        });
-        assert_eq!(find_flag(&args, "-machine"), Some("virt"));
-        assert_eq!(find_flag(&args, "-accel"), Some("hvf"));
+        let args = build(&cfg(), Accelerator::Whpx, &disk, None, None, vec![], false);
+        assert_eq!(find_flag(&args, "-machine"), Some("q35"));
+        assert_eq!(find_flag(&args, "-accel"), Some("whpx"));
         assert_eq!(find_flag(&args, "-cpu"), Some("host"));
         assert_eq!(find_flag(&args, "-smp"), Some("4"));
         assert_eq!(find_flag(&args, "-m"), Some("2048"));
-        assert_eq!(find_flag(&args, "-bios"), Some("/fw/edk2-aarch64-code.fd"));
         assert_eq!(find_flag(&args, "-vnc"), Some("127.0.0.1:1"));
-        assert_eq!(
-            find_flag(&args, "-qmp"),
-            Some("unix:/vm/qmp.sock,server=on,wait=off")
-        );
-    }
-
-    #[test]
-    fn tcg_aarch64_uses_concrete_cpu() {
-        let c = cfg();
-        let disk = PathBuf::from("/vm/disk.qcow2");
-        let args = build_args(&QemuLaunch {
-            config: &c,
-            accel: Accelerator::Tcg,
-            guest_arch: "aarch64",
-            disk: &disk,
-            iso: None,
-            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
-            vnc_display: 0,
-            qmp: QmpEndpoint::Tcp(4444),
-            network: vec![],
-            prelaunch: false,
-        });
-        assert_eq!(find_flag(&args, "-cpu"), Some("cortex-a72"));
         assert_eq!(
             find_flag(&args, "-qmp"),
             Some("tcp:127.0.0.1:4444,server=on,wait=off")
@@ -376,33 +309,36 @@ mod tests {
     }
 
     #[test]
+    fn tcg_uses_qemu64_cpu() {
+        let disk = PathBuf::from("/vm/disk.qcow2");
+        let args = build(&cfg(), Accelerator::Tcg, &disk, None, None, vec![], false);
+        assert_eq!(find_flag(&args, "-cpu"), Some("qemu64"));
+        assert_eq!(find_flag(&args, "-accel"), Some("tcg"));
+    }
+
+    #[test]
     fn iso_attaches_virtio_cdrom() {
         let mut c = cfg();
-        c.iso = Some("/iso/alpine.iso".into());
+        c.iso = Some("/iso/win.iso".into());
         let disk = PathBuf::from("/vm/disk.qcow2");
-        let sock = PathBuf::from("/vm/qmp.sock");
-        let args = build_args(&QemuLaunch {
-            config: &c,
-            accel: Accelerator::Hvf,
-            guest_arch: "aarch64",
-            disk: &disk,
-            iso: Some(Path::new("/iso/alpine.iso")),
-            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
-            vnc_display: 2,
-            qmp: QmpEndpoint::UnixSocket(&sock),
-            network: vec![],
-            prelaunch: false,
-        });
+        let args = build(
+            &c,
+            Accelerator::Whpx,
+            &disk,
+            Some(Path::new("/iso/win.iso")),
+            None,
+            vec![],
+            false,
+        );
         let joined = args.join(" ");
-        assert!(joined.contains("file=/iso/alpine.iso,if=virtio,media=cdrom,format=raw"));
+        assert!(joined.contains("file=/iso/win.iso,if=virtio,media=cdrom,format=raw"));
         assert_eq!(find_flag(&args, "-boot"), Some("order=dc"));
     }
 
     #[test]
     fn port_forwards_render_hostfwd() {
-        // Network fragments are now built by `qemu::net::network_args` and spliced
-        // into the argv. Port forwards bind loopback (127.0.0.1) by default
-        // (decision A1 — sanctioned migration from the old empty-host form).
+        // Network fragments are built by `qemu::net::network_args` and spliced
+        // in. Forwards bind loopback (127.0.0.1) by default.
         let mut c = cfg();
         c.network.port_forwards = vec![PortForward {
             host: 2222,
@@ -410,58 +346,81 @@ mod tests {
             udp: false,
             expose_lan: false,
         }];
+        let network = crate::qemu::net::network_args(&c.network, Accelerator::Whpx).unwrap();
         let disk = PathBuf::from("/vm/disk.qcow2");
-        let sock = PathBuf::from("/vm/qmp.sock");
-        let network =
-            crate::qemu::net::network_args(&c.network, Accelerator::Hvf, "macos").unwrap();
-        let args = build_args(&QemuLaunch {
-            config: &c,
-            accel: Accelerator::Hvf,
-            guest_arch: "aarch64",
-            disk: &disk,
-            iso: None,
-            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
-            vnc_display: 1,
-            qmp: QmpEndpoint::UnixSocket(&sock),
-            network,
-            prelaunch: false,
-        });
+        let args = build(&c, Accelerator::Whpx, &disk, None, None, network, false);
         assert_eq!(
             find_flag(&args, "-netdev"),
             Some("user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22")
         );
     }
 
-    // ---- Phase 5 — virtio-9p shared folders + prelaunch -S ----
+    // ---- x86-64 firmware (OVMF / SeaBIOS) ----
 
-    use crate::model::SharedFolder;
+    #[test]
+    fn ovmf_emits_two_pflash_drives_no_bios() {
+        let c = cfg();
+        let disk = PathBuf::from("/vm/disk.qcow2");
+        let code = PathBuf::from("/fw/edk2-x86_64-code.fd");
+        let vars = PathBuf::from("/vm/OVMF_VARS.fd");
+        let args = build(
+            &c,
+            Accelerator::Whpx,
+            &disk,
+            None,
+            Some(Firmware {
+                code: &code,
+                vars: &vars,
+            }),
+            vec![],
+            false,
+        );
+        let joined = args.join(" ");
+        assert_eq!(find_flag(&args, "-machine"), Some("q35"));
+        assert!(
+            joined.contains("if=pflash,format=raw,unit=0,readonly=on,file=/fw/edk2-x86_64-code.fd"),
+            "missing OVMF code pflash: {joined}"
+        );
+        assert!(
+            joined.contains("if=pflash,format=raw,unit=1,file=/vm/OVMF_VARS.fd"),
+            "missing OVMF vars pflash: {joined}"
+        );
+        // q35 has built-in VGA — no virtio-gpu device.
+        assert!(
+            !joined.contains("virtio-gpu-pci"),
+            "x86 must not add a virtio-gpu device: {joined}"
+        );
+    }
 
-    /// Build args for a config with the given shared folders + prelaunch flag,
-    /// returning the full argv (aarch64/HVF, no ISO).
+    #[test]
+    fn no_firmware_falls_back_to_seabios() {
+        // No OVMF → SeaBIOS: no pflash. TCG x86 uses qemu64.
+        let disk = PathBuf::from("/vm/disk.qcow2");
+        let args = build(&cfg(), Accelerator::Tcg, &disk, None, None, vec![], false);
+        let joined = args.join(" ");
+        assert_eq!(find_flag(&args, "-machine"), Some("q35"));
+        assert!(
+            !joined.contains("if=pflash"),
+            "SeaBIOS fallback must emit no pflash: {joined}"
+        );
+        assert_eq!(find_flag(&args, "-cpu"), Some("qemu64"));
+    }
+
+    // ---- virtio-9p shared folders + prelaunch -S ----
+
+    /// Build args for a config with the given shared folders + prelaunch flag.
     fn args_with(shared_folders: Vec<SharedFolder>, prelaunch: bool) -> Vec<String> {
         let mut c = cfg();
         c.shared_folders = shared_folders;
         let disk = PathBuf::from("/vm/disk.qcow2");
-        let sock = PathBuf::from("/vm/qmp.sock");
-        build_args(&QemuLaunch {
-            config: &c,
-            accel: Accelerator::Hvf,
-            guest_arch: "aarch64",
-            disk: &disk,
-            iso: None,
-            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
-            vnc_display: 1,
-            qmp: QmpEndpoint::UnixSocket(&sock),
-            network: vec![],
-            prelaunch,
-        })
+        build(&c, Accelerator::Whpx, &disk, None, None, vec![], prelaunch)
     }
 
     #[test]
     fn shared_folder_emits_fsdev_and_device() {
         let args = args_with(
             vec![SharedFolder {
-                host_path: "/home/user/share".into(),
+                host_path: "C:/Users/me/share".into(),
                 mount_tag: "share".into(),
                 read_only: false,
             }],
@@ -470,7 +429,7 @@ mod tests {
         let joined = args.join(" ");
         assert!(
             joined.contains(
-                "-fsdev local,id=fsdev0,path=/home/user/share,security_model=mapped-xattr"
+                "-fsdev local,id=fsdev0,path=C:/Users/me/share,security_model=mapped-xattr"
             ),
             "fsdev fragment missing/wrong: {joined}"
         );
@@ -478,7 +437,6 @@ mod tests {
             joined.contains("-device virtio-9p-pci,fsdev=fsdev0,mount_tag=share"),
             "9p device fragment missing/wrong: {joined}"
         );
-        // No readonly suffix when read_only == false.
         assert!(
             !joined.contains("readonly=on"),
             "must not emit readonly=on for a writable share: {joined}"
@@ -489,7 +447,7 @@ mod tests {
     fn shared_folder_readonly_appends_flag() {
         let args = args_with(
             vec![SharedFolder {
-                host_path: "/data".into(),
+                host_path: "D:/data".into(),
                 mount_tag: "ro".into(),
                 read_only: true,
             }],
@@ -498,7 +456,7 @@ mod tests {
         let joined = args.join(" ");
         assert!(
             joined.contains(
-                "-fsdev local,id=fsdev0,path=/data,security_model=mapped-xattr,readonly=on"
+                "-fsdev local,id=fsdev0,path=D:/data,security_model=mapped-xattr,readonly=on"
             ),
             "readonly fsdev fragment missing/wrong: {joined}"
         );
@@ -506,11 +464,9 @@ mod tests {
 
     #[test]
     fn shared_folder_host_path_comma_escaped() {
-        // A comma in the host path must be doubled so QEMU treats it as literal,
-        // not an option separator (injection guard, decision A).
         let args = args_with(
             vec![SharedFolder {
-                host_path: "/host/we,ird".into(),
+                host_path: "C:/we,ird".into(),
                 mount_tag: "tag".into(),
                 read_only: false,
             }],
@@ -518,7 +474,7 @@ mod tests {
         );
         let joined = args.join(" ");
         assert!(
-            joined.contains("path=/host/we,,ird,security_model=mapped-xattr"),
+            joined.contains("path=C:/we,,ird,security_model=mapped-xattr"),
             "host_path comma not escaped: {joined}"
         );
     }
@@ -528,12 +484,12 @@ mod tests {
         let args = args_with(
             vec![
                 SharedFolder {
-                    host_path: "/a".into(),
+                    host_path: "C:/a".into(),
                     mount_tag: "first".into(),
                     read_only: false,
                 },
                 SharedFolder {
-                    host_path: "/b".into(),
+                    host_path: "C:/b".into(),
                     mount_tag: "second".into(),
                     read_only: true,
                 },
@@ -542,12 +498,12 @@ mod tests {
         );
         let joined = args.join(" ");
         assert!(
-            joined.contains("local,id=fsdev0,path=/a,security_model=mapped-xattr")
+            joined.contains("local,id=fsdev0,path=C:/a,security_model=mapped-xattr")
                 && joined.contains("virtio-9p-pci,fsdev=fsdev0,mount_tag=first"),
             "folder 0 indexing wrong: {joined}"
         );
         assert!(
-            joined.contains("local,id=fsdev1,path=/b,security_model=mapped-xattr,readonly=on")
+            joined.contains("local,id=fsdev1,path=C:/b,security_model=mapped-xattr,readonly=on")
                 && joined.contains("virtio-9p-pci,fsdev=fsdev1,mount_tag=second"),
             "folder 1 indexing wrong: {joined}"
         );
@@ -564,105 +520,26 @@ mod tests {
 
     #[test]
     fn cold_start_never_emits_dash_s() {
-        // A cold start (prelaunch == false) must NEVER pause the guest with -S,
-        // even with shared folders + an ISO present (broadest arg set).
         let mut c = cfg();
-        c.iso = Some("/iso/alpine.iso".into());
+        c.iso = Some("/iso/win.iso".into());
         c.shared_folders = vec![SharedFolder {
-            host_path: "/share".into(),
+            host_path: "C:/share".into(),
             mount_tag: "share".into(),
             read_only: false,
         }];
         let disk = PathBuf::from("/vm/disk.qcow2");
-        let sock = PathBuf::from("/vm/qmp.sock");
-        let args = build_args(&QemuLaunch {
-            config: &c,
-            accel: Accelerator::Hvf,
-            guest_arch: "aarch64",
-            disk: &disk,
-            iso: Some(Path::new("/iso/alpine.iso")),
-            firmware: Some(Firmware::Bios(Path::new("/fw/x.fd"))),
-            vnc_display: 1,
-            qmp: QmpEndpoint::UnixSocket(&sock),
-            network: vec![],
-            prelaunch: false,
-        });
+        let args = build(
+            &c,
+            Accelerator::Whpx,
+            &disk,
+            Some(Path::new("/iso/win.iso")),
+            None,
+            vec![],
+            false,
+        );
         assert!(
             !args.iter().any(|a| a == "-S"),
             "cold start must never emit -S: {args:?}"
         );
-    }
-
-    // ---- Windows-readiness: x86_64 firmware + machine ----
-
-    #[test]
-    fn x86_pflash_emits_two_pflash_drives() {
-        let c = cfg();
-        let disk = PathBuf::from("/vm/disk.qcow2");
-        let sock = PathBuf::from("/vm/qmp.sock");
-        let code = PathBuf::from("/fw/edk2-x86_64-code.fd");
-        let vars = PathBuf::from("/vm/OVMF_VARS.fd");
-        let args = build_args(&QemuLaunch {
-            config: &c,
-            accel: Accelerator::Tcg,
-            guest_arch: "x86_64",
-            disk: &disk,
-            iso: None,
-            firmware: Some(Firmware::Pflash {
-                code: &code,
-                vars: &vars,
-            }),
-            vnc_display: 1,
-            qmp: QmpEndpoint::UnixSocket(&sock),
-            network: vec![],
-            prelaunch: false,
-        });
-        let joined = args.join(" ");
-        assert_eq!(find_flag(&args, "-machine"), Some("q35"));
-        assert!(
-            joined.contains("if=pflash,format=raw,unit=0,readonly=on,file=/fw/edk2-x86_64-code.fd"),
-            "missing OVMF code pflash: {joined}"
-        );
-        assert!(
-            joined.contains("if=pflash,format=raw,unit=1,file=/vm/OVMF_VARS.fd"),
-            "missing OVMF vars pflash: {joined}"
-        );
-        // x86 OVMF must NOT use -bios, and q35 has built-in VGA (no virtio-gpu).
-        assert!(
-            find_flag(&args, "-bios").is_none(),
-            "x86 OVMF must not use -bios: {joined}"
-        );
-        assert!(
-            !joined.contains("virtio-gpu-pci"),
-            "x86 must not add a virtio-gpu device: {joined}"
-        );
-    }
-
-    #[test]
-    fn x86_no_firmware_falls_back_to_seabios() {
-        // No OVMF found → SeaBIOS: no -bios, no pflash. TCG x86 uses qemu64.
-        let c = cfg();
-        let disk = PathBuf::from("/vm/disk.qcow2");
-        let sock = PathBuf::from("/vm/qmp.sock");
-        let args = build_args(&QemuLaunch {
-            config: &c,
-            accel: Accelerator::Tcg,
-            guest_arch: "x86_64",
-            disk: &disk,
-            iso: None,
-            firmware: None,
-            vnc_display: 1,
-            qmp: QmpEndpoint::UnixSocket(&sock),
-            network: vec![],
-            prelaunch: false,
-        });
-        let joined = args.join(" ");
-        assert_eq!(find_flag(&args, "-machine"), Some("q35"));
-        assert!(find_flag(&args, "-bios").is_none());
-        assert!(
-            !joined.contains("if=pflash"),
-            "SeaBIOS fallback must emit no pflash: {joined}"
-        );
-        assert_eq!(find_flag(&args, "-cpu"), Some("qemu64"));
     }
 }

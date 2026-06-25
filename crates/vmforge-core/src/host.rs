@@ -1,10 +1,9 @@
-//! Host capability probing.
+//! Host capability probing (Windows / x86-64).
 //!
-//! Detects OS/arch, locates the QEMU binaries, and determines which
-//! accelerator this host can actually use (HVF / WHPX / KVM, with a TCG
-//! software-emulation fallback). Backs VMForge's first-run capability
-//! screen. The pure parsers at the bottom are unit-tested, so the suite
-//! needs no real QEMU installed.
+//! Locates the QEMU binaries and determines whether this host can use **WHPX**
+//! (Windows Hypervisor Platform), falling back to **TCG** software emulation.
+//! Backs VMForge's first-run capability screen. The pure parsers at the bottom
+//! are unit-tested, so the suite needs no real QEMU installed.
 
 use crate::error::Result;
 use crate::model::NetworkMode;
@@ -17,12 +16,8 @@ use std::process::Command;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Accelerator {
-    /// macOS Hypervisor.framework.
-    Hvf,
     /// Windows Hypervisor Platform.
     Whpx,
-    /// Linux KVM.
-    Kvm,
     /// Pure software emulation — always available, always slow.
     Tcg,
 }
@@ -31,9 +26,7 @@ impl Accelerator {
     /// The string QEMU expects for `-accel <x>`.
     pub fn as_qemu_arg(self) -> &'static str {
         match self {
-            Self::Hvf => "hvf",
             Self::Whpx => "whpx",
-            Self::Kvm => "kvm",
             Self::Tcg => "tcg",
         }
     }
@@ -45,9 +38,7 @@ impl Accelerator {
 
     fn from_name(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "hvf" => Some(Self::Hvf),
             "whpx" => Some(Self::Whpx),
-            "kvm" => Some(Self::Kvm),
             "tcg" => Some(Self::Tcg),
             _ => None,
         }
@@ -87,9 +78,9 @@ pub struct NetworkCapabilities {
 /// Everything the UI needs to explain what this host can and can't do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostCapabilities {
-    /// `"macos"`, `"windows"`, or `"linux"`.
+    /// Host OS (`std::env::consts::OS`). Expected to be `"windows"`.
     pub os: String,
-    /// `"aarch64"` or `"x86_64"`.
+    /// Host CPU arch (`std::env::consts::ARCH`). Expected to be `"x86_64"`.
     pub arch: String,
     /// The accelerator VMForge will use by default on this host.
     pub preferred_accelerator: Accelerator,
@@ -98,7 +89,7 @@ pub struct HostCapabilities {
     /// Whether the preferred accelerator is hardware (vs TCG fallback).
     pub hardware_accelerated: bool,
     pub qemu_img: QemuBinary,
-    /// `qemu-system-*` binaries we probed (aarch64 + x86_64).
+    /// The `qemu-system-x86_64` binary we probed.
     pub system_binaries: Vec<QemuBinary>,
     /// Per-mode networking capabilities (user available; bridged/host-only
     /// gated behind elevated permissions in this build).
@@ -107,7 +98,7 @@ pub struct HostCapabilities {
     pub warnings: Vec<String>,
 }
 
-const SYSTEM_CANDIDATES: &[&str] = &["qemu-system-aarch64", "qemu-system-x86_64"];
+const SYSTEM_CANDIDATES: &[&str] = &["qemu-system-x86_64"];
 
 /// Probe the current host. Never fails today, but returns [`Result`] so
 /// future privileged checks can surface errors.
@@ -137,18 +128,18 @@ pub fn probe() -> Result<HostCapabilities> {
         }
     };
 
-    // Probe accelerators against the binary that matches the host arch.
-    let native = native_system_binary(&arch);
+    // Probe accelerators against the x86-64 system emulator.
+    let native = system_binary();
     let available_accelerators = if system_binaries
         .iter()
         .any(|b| b.name == native && b.present)
     {
-        query_accelerators(&native)
+        query_accelerators(native)
     } else {
         Vec::new()
     };
 
-    let preferred = pick_preferred(&os, &available_accelerators);
+    let preferred = pick_preferred(&available_accelerators);
     let hardware_accelerated = preferred.is_hardware();
 
     if !qemu_img.present {
@@ -163,21 +154,16 @@ pub fn probe() -> Result<HostCapabilities> {
             "No hardware accelerator available on {os}; falling back to TCG software emulation (expect reduced performance)."
         ));
     }
-    if os == "macos" && arch == "aarch64" {
-        warnings.push(
-            "Apple Silicon: ARM64 guests are HVF-accelerated; x86/x64 guests run under TCG emulation and will be slow.".to_string(),
-        );
-    }
-    // On Windows, WHPX being unavailable almost always means another component
-    // owns the hypervisor (Hyper-V / WSL2 / memory-integrity VBS). Name the
-    // usual cause instead of the generic TCG-fallback line (CLAUDE.md mandate).
-    if os == "windows" && !hardware_accelerated && system_binaries.iter().any(|b| b.present) {
+    // WHPX being unavailable almost always means another component owns the
+    // hypervisor (Hyper-V / WSL2 / memory-integrity VBS). Name the usual cause
+    // instead of a generic TCG-fallback line.
+    if !hardware_accelerated && system_binaries.iter().any(|b| b.present) {
         warnings.push(
             "Windows Hypervisor Platform (WHPX) is unavailable — usually because Hyper-V, WSL2, or memory-integrity (VBS) is holding the virtualization stack. Enable the Windows Hypervisor Platform feature for hardware acceleration; until then VMForge runs guests under TCG (slow).".to_string(),
         );
     }
 
-    let network = probe_network(&os);
+    let network = probe_network();
 
     Ok(HostCapabilities {
         os,
@@ -198,7 +184,7 @@ pub fn probe() -> Result<HostCapabilities> {
 /// `available == false`, `requires_elevation == true`, with the shared per-OS
 /// reason (so the capability UI and the launch-reject path never drift). Port
 /// forwards bind loopback by default (`port_forward_loopback_only == true`).
-pub fn probe_network(os: &str) -> NetworkCapabilities {
+pub fn probe_network() -> NetworkCapabilities {
     let user = ModeCapability {
         mode: NetworkMode::User,
         available: true,
@@ -209,7 +195,7 @@ pub fn probe_network(os: &str) -> NetworkCapabilities {
         mode,
         available: false,
         requires_elevation: true,
-        reason: crate::qemu::net::elevated_reason(mode, os),
+        reason: crate::qemu::net::elevated_reason(mode),
     };
     NetworkCapabilities {
         modes: vec![
@@ -221,17 +207,9 @@ pub fn probe_network(os: &str) -> NetworkCapabilities {
     }
 }
 
-/// QEMU system-emulator binary name for a guest/host arch.
-pub fn system_binary(arch: &str) -> &'static str {
-    match arch {
-        "aarch64" => "qemu-system-aarch64",
-        "x86_64" => "qemu-system-x86_64",
-        _ => "qemu-system-x86_64",
-    }
-}
-
-fn native_system_binary(arch: &str) -> String {
-    system_binary(arch).to_string()
+/// The QEMU system-emulator binary. VMForge runs x86-64 guests only.
+pub fn system_binary() -> &'static str {
+    "qemu-system-x86_64"
 }
 
 /// Probe a QEMU binary's version, resolving it to an absolute path first (D3).
@@ -261,17 +239,10 @@ fn query_accelerators(bin: &str) -> Vec<Accelerator> {
     }
 }
 
-/// Choose the host's natural hardware accelerator if QEMU advertises it,
-/// otherwise fall back to TCG.
-fn pick_preferred(os: &str, available: &[Accelerator]) -> Accelerator {
-    let want = match os {
-        "macos" => Accelerator::Hvf,
-        "windows" => Accelerator::Whpx,
-        "linux" => Accelerator::Kvm,
-        _ => Accelerator::Tcg,
-    };
-    if available.contains(&want) {
-        want
+/// WHPX when QEMU advertises it on this host, otherwise TCG software emulation.
+fn pick_preferred(available: &[Accelerator]) -> Accelerator {
+    if available.contains(&Accelerator::Whpx) {
+        Accelerator::Whpx
     } else {
         Accelerator::Tcg
     }
@@ -314,38 +285,33 @@ mod tests {
 
     #[test]
     fn parses_accel_help() {
-        let out = "Accelerators supported in QEMU binary:\nhvf\ntcg\n";
+        // QEMU advertises whpx on a WHPX-capable Windows host (only whpx/tcg are
+        // recognized now; anything else is ignored).
+        let out = "Accelerators supported in QEMU binary:\nwhpx\ntcg\nkvm\n";
         assert_eq!(
             parse_accelerators(out),
-            vec![Accelerator::Hvf, Accelerator::Tcg]
+            vec![Accelerator::Whpx, Accelerator::Tcg]
         );
     }
 
     #[test]
-    fn prefers_hardware_when_available() {
+    fn prefers_whpx_when_available() {
         assert_eq!(
-            pick_preferred("macos", &[Accelerator::Hvf, Accelerator::Tcg]),
-            Accelerator::Hvf
-        );
-        assert_eq!(
-            pick_preferred("linux", &[Accelerator::Kvm, Accelerator::Tcg]),
-            Accelerator::Kvm
+            pick_preferred(&[Accelerator::Whpx, Accelerator::Tcg]),
+            Accelerator::Whpx
         );
     }
 
     #[test]
     fn falls_back_to_tcg_without_hardware() {
-        assert_eq!(
-            pick_preferred("macos", &[Accelerator::Tcg]),
-            Accelerator::Tcg
-        );
-        assert_eq!(pick_preferred("windows", &[]), Accelerator::Tcg);
+        assert_eq!(pick_preferred(&[Accelerator::Tcg]), Accelerator::Tcg);
+        assert_eq!(pick_preferred(&[]), Accelerator::Tcg);
     }
 
     // ---- (E.2) network capability shape ----
     #[test]
     fn network_caps_phase4_shape() {
-        let caps = probe_network("macos");
+        let caps = probe_network();
         assert!(
             caps.port_forward_loopback_only,
             "forwards must bind loopback by default"
@@ -377,15 +343,15 @@ mod tests {
             );
         }
 
-        // On macOS the bridged reason must mention vmnet (matches net.rs).
+        // The bridged reason names the Windows requirement (matches net.rs).
         let bridged = caps
             .modes
             .iter()
             .find(|m| m.mode == NetworkMode::Bridged)
             .unwrap();
         assert!(
-            bridged.reason.contains("vmnet"),
-            "macos bridged reason must mention vmnet: {}",
+            bridged.reason.contains("Administrator"),
+            "bridged reason must mention the Administrator requirement: {}",
             bridged.reason
         );
     }

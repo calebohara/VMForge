@@ -53,7 +53,6 @@ async fn boots_real_guest_and_controls_via_qmp() {
         metadata: Default::default(),
         snapshots: Vec::new(),
         shared_folders: Vec::new(),
-        guest_arch: None,
     };
     let created = creator.create_vm(draft).await.expect("persist VM");
     let id = created.id.to_string();

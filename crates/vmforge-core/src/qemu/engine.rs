@@ -26,21 +26,9 @@ use uuid::Uuid;
 /// capture can be slow on a large guest, so this is generous.
 const SNAPSHOT_JOB_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// How the QMP channel for a given VM is bound. Unix socket where available,
-/// TCP loopback on Windows.
-enum QmpBind {
-    #[cfg(unix)]
-    Unix(PathBuf),
-    // Constructed only on non-unix (Windows uses TCP loopback for QMP).
-    #[allow(dead_code)]
-    Tcp(u16),
-}
-
 struct RunningVm {
     config: VmConfig,
     vnc_port: u16,
-    #[cfg_attr(not(unix), allow(dead_code))]
-    qmp_socket: Option<PathBuf>,
     process: Mutex<QemuProcess>,
     qmp: Mutex<QmpClient>,
     bridge: Mutex<Option<crate::console::VncBridge>>,
@@ -48,7 +36,6 @@ struct RunningVm {
 
 pub struct QemuHypervisor {
     accel: Accelerator,
-    host_arch: String,
     library_dir: PathBuf,
     /// Persistence store (`vmforge.toml` per VM directory). Rooted at
     /// `library_dir`.
@@ -72,7 +59,6 @@ impl QemuHypervisor {
         let caps = host::probe()?;
         Ok(Self {
             accel: caps.preferred_accelerator,
-            host_arch: caps.arch,
             library: Library::new(library_dir.clone()),
             library_dir,
             running: Mutex::new(HashMap::new()),
@@ -82,10 +68,10 @@ impl QemuHypervisor {
 
     /// Build with an explicit library directory and a forced accelerator.
     ///
-    /// Test/dev seam: the suspend/resume round-trip relies on QMP
-    /// `snapshot-load`, which crashes under HVF on aarch64 — so verifying it on
-    /// this host requires forcing TCG. Production code uses [`new`](Self::new) /
-    /// [`with_library_dir`](Self::with_library_dir), which always probe.
+    /// Test/dev seam: suspend/resume relies on QMP `snapshot-load`, which is only
+    /// exercised under TCG for now (hardware-accel `snapshot-load` is unverified
+    /// on Windows/WHPX). Forcing TCG lets the round-trip be tested on any host.
+    /// Production code uses [`new`](Self::new) / [`with_library_dir`](Self::with_library_dir).
     pub fn with_library_dir_and_accel(library_dir: PathBuf, accel: Accelerator) -> Result<Self> {
         let mut hv = Self::with_library_dir(library_dir)?;
         hv.accel = accel;
@@ -111,17 +97,11 @@ impl QemuHypervisor {
         Ok(port)
     }
 
-    /// Per-VM accelerator + emulation flag. A guest arch that differs from the
-    /// host can only run under TCG (emulated, slow — surfaced in the UI); a
-    /// native guest uses the host's preferred accelerator.
-    fn accel_for(&self, config: &VmConfig) -> (Accelerator, bool) {
-        let emulated = config.effective_arch(&self.host_arch) != self.host_arch;
-        let accel = if emulated {
-            Accelerator::Tcg
-        } else {
-            self.accel
-        };
-        (accel, emulated)
+    /// The accelerator + emulation flag for this host. `emulated` is true when
+    /// running under TCG software emulation (WHPX unavailable) — surfaced in the
+    /// UI as the honest "slow" indicator.
+    fn accel_for(&self) -> (Accelerator, bool) {
+        (self.accel, !self.accel.is_hardware())
     }
 
     /// Summaries of currently-running VMs.
@@ -131,7 +111,7 @@ impl QemuHypervisor {
             .await
             .values()
             .map(|vm| {
-                let (accelerator, emulated) = self.accel_for(&vm.config);
+                let (accelerator, emulated) = self.accel_for();
                 VmSummary {
                     id: vm.config.id,
                     name: vm.config.name.clone(),
@@ -208,13 +188,11 @@ impl QemuHypervisor {
                 // Identity-check before removing: a concurrent `start` may have
                 // replaced this id with a fresh entry while we probed outside
                 // the lock (ABA). Only reap the exact allocation we observed
-                // exited, so we never evict a just-restarted VM or delete its
-                // live QMP socket.
+                // exited, so we never evict a just-restarted VM. (The QMP TCP
+                // port is released by the OS when the process exits — nothing to
+                // clean up.)
                 if reg.get(id).is_some_and(|cur| Arc::ptr_eq(cur, old_arc)) {
                     reg.remove(id);
-                    if let Some(sock) = &old_arc.qmp_socket {
-                        let _ = tokio::fs::remove_file(sock).await;
-                    }
                 }
             }
         }
@@ -237,12 +215,12 @@ impl QemuHypervisor {
         // Single directory scan + parse.
         let configs = self.library.load_all().await?;
 
-        // Persisted VMs → Defined (accelerator/emulated filled here, per guest
-        // arch: a foreign-arch guest reports TCG + emulated).
+        // Persisted VMs → Defined (accelerator/emulated filled here; emulated
+        // means running under TCG).
+        let (accelerator, emulated) = self.accel_for();
         let mut by_id: HashMap<VmId, VmSummary> = configs
             .iter()
             .map(|c| {
-                let (accelerator, emulated) = self.accel_for(c);
                 (
                     c.id,
                     VmSummary {
@@ -259,15 +237,11 @@ impl QemuHypervisor {
         // Overlay running state by id (reaps exited entries).
         let running = self.running_states().await;
         if !running.is_empty() {
-            // Build a lookup of running configs (name + per-arch accel/emulated)
-            // for VMs not in the library.
-            let live_meta: HashMap<String, (String, Accelerator, bool)> = {
+            // Names of running VMs not in the library (for a defensive insert).
+            let live_names: HashMap<String, String> = {
                 let reg = self.running.lock().await;
                 reg.iter()
-                    .map(|(k, v)| {
-                        let (accel, emulated) = self.accel_for(&v.config);
-                        (k.clone(), (v.config.name.clone(), accel, emulated))
-                    })
+                    .map(|(k, v)| (k.clone(), v.config.name.clone()))
                     .collect()
             };
             for (id_str, state) in running {
@@ -278,10 +252,10 @@ impl QemuHypervisor {
                     Some(summary) => summary.state = state,
                     None => {
                         // Running but not persisted — include defensively.
-                        let (name, accelerator, emulated) = live_meta
+                        let name = live_names
                             .get(&id_str)
                             .cloned()
-                            .unwrap_or_else(|| (id_str.clone(), self.accel, false));
+                            .unwrap_or_else(|| id_str.clone());
                         by_id.insert(
                             id,
                             VmSummary {
@@ -341,8 +315,7 @@ impl QemuHypervisor {
     }
 
     /// Delete a persisted VM. Rejected if live; rejected if it is a linked-clone
-    /// parent (A5 — deleting it would orphan its children's backing); also
-    /// clears any stale QMP socket for the id.
+    /// parent (A5 — deleting it would orphan its children's backing).
     pub async fn delete(&self, id: &str, delete_disks: bool) -> Result<()> {
         // Hold start_lock across the live-check + delete so a concurrent `start`
         // can't launch the VM whose directory we're about to remove.
@@ -353,11 +326,6 @@ impl QemuHypervisor {
         self.reject_if_has_dependents(&config, "delete").await?;
         let parsed = parse_id(id)?;
         self.library.delete_vm(&parsed, delete_disks).await?;
-        #[cfg(unix)]
-        {
-            let sock = crate::paths::qmp_socket_path(id);
-            let _ = tokio::fs::remove_file(&sock).await;
-        }
         Ok(())
     }
 
@@ -679,124 +647,58 @@ impl QemuHypervisor {
             .ok_or_else(|| Error::Other("no free VNC port (5901-5963)".into()))?;
         let vnc_port = 5900 + display;
 
-        // Guest architecture (create-time choice; defaults to host arch). A
-        // foreign arch can only run under TCG — HVF/WHPX/KVM cannot virtualize a
-        // CPU the host doesn't have — so downgrade the accelerator and mark it
-        // emulated (surfaced honestly in the UI).
-        let guest_arch = config.effective_arch(&self.host_arch);
-        // Defense-in-depth (the command layer also validates): reject an
-        // unsupported arch from a hand-edited/programmatic config with a clean
-        // error rather than silently mis-selecting the x86_64 emulator downstream.
-        if guest_arch != "x86_64" && guest_arch != "aarch64" {
-            return Err(Error::Config(format!(
-                "unsupported guest architecture '{guest_arch}' (expected x86_64 or aarch64)"
-            )));
-        }
-        let emulated = guest_arch != self.host_arch;
-        let accel = if emulated {
-            Accelerator::Tcg
-        } else {
-            self.accel
-        };
+        // WHPX when available on this host, otherwise TCG (set at probe).
+        let accel = self.accel;
 
-        // Resolve QEMU to an ABSOLUTE path once (D3), picking the system emulator
-        // for the GUEST arch (so an x86_64 guest uses qemu-system-x86_64 even on
-        // an aarch64 host). A Finder-launched `.app` inherits an empty `PATH`, so
-        // spawning the bare name would fail even though QEMU is installed.
-        let bin_name = host::system_binary(&guest_arch);
+        // Resolve QEMU to an ABSOLUTE path once and spawn by it (a GUI-launched
+        // app may not have the QEMU install dir on PATH). The resolved bin dir is
+        // prepended to the child's PATH so QEMU finds its sibling DLLs/helpers.
+        let bin_name = host::system_binary();
         let bin = crate::qemu_resolve::resolve_qemu_binary(bin_name).ok_or_else(|| {
             Error::QemuNotFound(format!(
                 "{bin_name} not found on PATH or in the known QEMU install locations; install QEMU or set its location in settings"
             ))
         })?;
-        // The resolved bin dir, prepended to the child's PATH env so QEMU can
-        // find any sibling helpers under the same prefix.
         let bin_dir = bin.parent().map(std::path::Path::to_path_buf);
 
-        // Firmware (owned; borrowed into QemuLaunch below):
-        //  - aarch64 `virt`: required UEFI code blob via `-bios`.
-        //  - x86_64: OVMF (UEFI) when found — needed to boot Windows 11 — copying
-        //    the VARS template to a per-VM writable `OVMF_VARS.fd`; otherwise fall
-        //    back to built-in SeaBIOS (legacy boot; logged).
-        enum OwnedFirmware {
-            Bios(PathBuf),
-            Pflash { code: PathBuf, vars: PathBuf },
-        }
-        let owned_fw: Option<OwnedFirmware> = if guest_arch == "aarch64" {
-            let code = firmware::find_aarch64_uefi(&bin).ok_or_else(|| {
-                Error::Other(
-                    "aarch64 UEFI firmware (edk2-aarch64-code.fd) not found; install QEMU firmware"
-                        .into(),
-                )
-            })?;
-            Some(OwnedFirmware::Bios(code))
-        } else {
-            match firmware::find_x86_64_uefi(&bin) {
-                Some(x86) => {
-                    // NVRAM must be writable and per-VM — copy the template once.
-                    let vars_dest = vm_dir.join("OVMF_VARS.fd");
-                    if !vars_dest.exists() {
-                        tokio::fs::copy(&x86.vars_template, &vars_dest)
-                            .await
-                            .map_err(|e| {
-                                Error::Other(format!(
-                                    "failed to stage OVMF NVRAM {}: {e}",
-                                    vars_dest.display()
-                                ))
-                            })?;
-                        // `fs::copy` preserves the source mode bits, and many
-                        // distro OVMF VARS templates ship read-only — but pflash
-                        // unit 1 is opened read-write, so force the staged copy
-                        // writable or the UEFI guest won't boot.
-                        make_writable(&vars_dest).await?;
-                    }
-                    Some(OwnedFirmware::Pflash {
-                        code: x86.code,
-                        vars: vars_dest,
-                    })
+        // x86-64 firmware: OVMF (UEFI) when found — needed to boot Windows —
+        // staging the VARS template to a per-VM writable `OVMF_VARS.fd`;
+        // otherwise fall back to the built-in SeaBIOS (legacy boot; logged).
+        let owned_fw: Option<(PathBuf, PathBuf)> = match firmware::find_x86_64_uefi(&bin) {
+            Some(x86) => {
+                let vars_dest = vm_dir.join("OVMF_VARS.fd");
+                if !vars_dest.exists() {
+                    tokio::fs::copy(&x86.vars_template, &vars_dest)
+                        .await
+                        .map_err(|e| {
+                            Error::Other(format!(
+                                "failed to stage OVMF NVRAM {}: {e}",
+                                vars_dest.display()
+                            ))
+                        })?;
+                    // `fs::copy` preserves the source mode bits, and some OVMF
+                    // VARS templates ship read-only — but pflash unit 1 is opened
+                    // read-write, so force the staged copy writable.
+                    make_writable(&vars_dest).await?;
                 }
-                None => {
-                    tracing::warn!(
-                        target: "vmforge_core::qemu",
-                        "x86_64 OVMF firmware not found; falling back to SeaBIOS (legacy BIOS). UEFI-only guests such as Windows 11 will not boot — install QEMU's edk2/OVMF firmware."
-                    );
-                    None
-                }
+                Some((x86.code, vars_dest))
+            }
+            None => {
+                tracing::warn!(
+                    target: "vmforge_core::qemu",
+                    "x86-64 OVMF firmware not found; falling back to SeaBIOS (legacy BIOS). UEFI-only guests such as Windows 11 will not boot — install QEMU's edk2/OVMF firmware."
+                );
+                None
             }
         };
-        let firmware = owned_fw.as_ref().map(|f| match f {
-            OwnedFirmware::Bios(code) => Firmware::Bios(code),
-            OwnedFirmware::Pflash { code, vars } => Firmware::Pflash { code, vars },
-        });
+        let firmware = owned_fw
+            .as_ref()
+            .map(|(code, vars)| Firmware { code, vars });
 
         let iso = config.iso.as_ref().map(PathBuf::from);
 
-        // Bind QMP per-OS. Sockets go in a short runtime dir (macOS path-length
-        // limit), not under the VM data dir.
-        #[cfg(unix)]
-        let qmp_bind = {
-            tokio::fs::create_dir_all(crate::paths::runtime_dir()).await?;
-            let sock = crate::paths::qmp_socket_path(&id);
-            let _ = tokio::fs::remove_file(&sock).await; // clear stale socket
-            QmpBind::Unix(sock)
-        };
-        #[cfg(not(unix))]
-        let qmp_bind = QmpBind::Tcp(free_tcp_port()?);
-
-        #[cfg(unix)]
-        let qmp_socket = if let QmpBind::Unix(p) = &qmp_bind {
-            Some(p.clone())
-        } else {
-            None
-        };
-        #[cfg(not(unix))]
-        let qmp_socket: Option<PathBuf> = None;
-
-        let qmp_arg = match &qmp_bind {
-            #[cfg(unix)]
-            QmpBind::Unix(p) => QmpEndpoint::UnixSocket(p),
-            QmpBind::Tcp(port) => QmpEndpoint::Tcp(*port),
-        };
+        // QMP control channel: a TCP loopback port chosen now and handed to QEMU.
+        let qmp_port = free_tcp_port()?;
 
         // Validate shared folders BEFORE spawn: existing host dirs, safe unique
         // tags. An invalid share is rejected here as `Error::Config` rather than
@@ -806,18 +708,17 @@ impl QemuHypervisor {
         // Build (and validate) the network fragments BEFORE spawning. An
         // unavailable mode (bridged/host-only) or an invalid port-forward/MAC is
         // rejected here as `Error::Config` — never a silent NAT fallback (A3/A4).
-        let network = crate::qemu::net::network_args(&config.network, accel, std::env::consts::OS)
+        let network = crate::qemu::net::network_args(&config.network, accel)
             .map_err(|e| Error::Config(e.to_string()))?;
 
         let args = build_args(&QemuLaunch {
             config,
             accel,
-            guest_arch: &guest_arch,
             disk: &disk,
             iso: iso.as_deref(),
             firmware,
             vnc_display: display,
-            qmp: qmp_arg,
+            qmp: QmpEndpoint(qmp_port),
             network,
             // Resume launches paused so snapshot-load + cont can run before the
             // guest executes; cold starts run immediately.
@@ -829,7 +730,7 @@ impl QemuHypervisor {
 
         // Connect QMP (the server appears shortly after spawn). Kill QEMU and
         // surface its log tail if we can't reach it.
-        let mut qmp = match connect_qmp(&qmp_bind, Duration::from_secs(15)).await {
+        let mut qmp = match connect_qmp(qmp_port, Duration::from_secs(15)).await {
             Ok(c) => c,
             Err(e) => {
                 let _ = proc.kill().await;
@@ -879,9 +780,6 @@ impl QemuHypervisor {
             };
             if let Err(e) = result {
                 let _ = proc.kill().await;
-                if let Some(sock) = &qmp_socket {
-                    let _ = tokio::fs::remove_file(sock).await;
-                }
                 return Err(e);
             }
         }
@@ -891,7 +789,6 @@ impl QemuHypervisor {
             Arc::new(RunningVm {
                 config: config.clone(),
                 vnc_port,
-                qmp_socket,
                 process: Mutex::new(proc),
                 qmp: Mutex::new(qmp),
                 bridge: Mutex::new(None),
@@ -902,20 +799,18 @@ impl QemuHypervisor {
 
     /// Suspend a live VM: capture RAM/device state to a fresh qcow2 vmstate tag,
     /// persist the tag in `metadata.suspended_snapshot` (BEFORE killing the
-    /// process), then terminate. Accelerator-gated: refused up front on
-    /// `aarch64 + HVF`, where QMP `snapshot-load` crashes (ORCHESTRATOR NOTE), so
-    /// an unresumable vmstate is never captured. Single-disk only.
+    /// process), then terminate. Accelerator-gated: refused under hardware
+    /// acceleration (WHPX) for now — QMP `snapshot-load` is only verified under
+    /// TCG, so an unresumable vmstate is never captured. Single-disk only.
     pub async fn suspend(&self, id: &str) -> Result<()> {
         let pre = self.get_config(id).await?;
 
         // Up-front accelerator gate: never capture a vmstate we cannot resume.
-        // QMP `snapshot-load` crashes under HVF on aarch64. This is keyed on the
-        // VM's EFFECTIVE accelerator: an emulated (foreign-arch) guest runs under
-        // TCG even on an aarch64 host, and suspend/resume works fine there.
-        let (accel, _) = self.accel_for(&pre);
-        if self.host_arch == "aarch64" && accel == Accelerator::Hvf {
+        // QMP `snapshot-load` is only verified under TCG; refuse under WHPX
+        // until it is confirmed stable on a real Windows host (decision D8).
+        if self.accel.is_hardware() {
             return Err(Error::Config(
-                "suspend/resume is unavailable with hardware acceleration (HVF) on this host"
+                "suspend/resume is unavailable under WHPX hardware acceleration on this host (TCG only for now)"
                     .into(),
             ));
         }
@@ -1088,9 +983,6 @@ impl Hypervisor for QemuHypervisor {
     async fn kill(&self, id: &str) -> Result<()> {
         let vm = self.get(id).await?;
         vm.process.lock().await.kill().await?;
-        if let Some(sock) = &vm.qmp_socket {
-            let _ = tokio::fs::remove_file(sock).await;
-        }
         self.running.lock().await.remove(id);
         Ok(())
     }
@@ -1149,21 +1041,17 @@ fn find_free_vnc_display() -> Option<u16> {
     (1..64u16).find(|&d| TcpListener::bind(("127.0.0.1", 5900 + d)).is_ok())
 }
 
-#[cfg(not(unix))]
+/// Bind an ephemeral loopback port, then release it for QEMU to re-bind. (There
+/// is a small TOCTOU window; a lost race surfaces as a clean retry error.)
 fn free_tcp_port() -> Result<u16> {
     let l = TcpListener::bind(("127.0.0.1", 0))?;
     Ok(l.local_addr()?.port())
 }
 
-async fn connect_qmp(bind: &QmpBind, timeout: Duration) -> Result<QmpClient> {
+async fn connect_qmp(port: u16, timeout: Duration) -> Result<QmpClient> {
     let start = tokio::time::Instant::now();
     loop {
-        let attempt = match bind {
-            #[cfg(unix)]
-            QmpBind::Unix(p) => QmpClient::connect_unix(p).await,
-            QmpBind::Tcp(port) => QmpClient::connect_tcp(&format!("127.0.0.1:{port}")).await,
-        };
-        match attempt {
+        match QmpClient::connect_tcp(&format!("127.0.0.1:{port}")).await {
             Ok(c) => return Ok(c),
             Err(e) => {
                 if start.elapsed() > timeout {
@@ -1239,7 +1127,6 @@ mod tests {
             metadata: Default::default(),
             snapshots: Vec::new(),
             shared_folders: Vec::new(),
-            guest_arch: None,
         }
     }
 
@@ -1250,9 +1137,9 @@ mod tests {
         let tail = "qemu-system-x86_64: -qmp tcp:127.0.0.1:54321,server=on,wait=off: \
              Failed to find an available port: Address already in use";
         assert!(log_indicates_qmp_bind_failure(tail));
-        // Unix bind-socket variant too.
+        // The alternate "Failed to bind socket" wording is matched too.
         assert!(log_indicates_qmp_bind_failure(
-            "qemu-system-aarch64: -qmp unix:/x.sock: Failed to bind socket: Address already in use"
+            "qemu-system-x86_64: -qmp tcp:127.0.0.1:5000: Failed to bind socket: Address already in use"
         ));
         // Must NOT false-positive on an unrelated hostfwd failure (no -qmp).
         assert!(!log_indicates_qmp_bind_failure(
@@ -1286,7 +1173,9 @@ mod tests {
         for s in &all {
             assert_eq!(s.state, VmState::Defined);
             assert_eq!(s.accelerator, hv.accelerator());
-            assert!(!s.emulated);
+            // emulated == running under TCG (host-dependent: true on a non-WHPX
+            // dev box, false where WHPX is available).
+            assert_eq!(s.emulated, !hv.accelerator().is_hardware());
         }
         // Empty registry → no running states.
         assert!(hv.running_states().await.is_empty());
@@ -1296,7 +1185,7 @@ mod tests {
             .is_none());
     }
 
-    // ---- (19) reaper drops an exited process (Stopped + remove + del socket)
+    // ---- (19) reaper drops an exited process (reports Stopped + removes entry)
     #[cfg(unix)]
     #[tokio::test]
     async fn reaper_drops_exited_process() {
@@ -1317,34 +1206,28 @@ mod tests {
         // Wait for it to actually exit so try_wait reports Some.
         proc.wait().await.expect("await exit");
 
-        // Fake a QMP socket file that the reaper must delete.
+        // Insert a registry entry pointing at the exited process.
         let id = Uuid::new_v4();
         let id_str = id.to_string();
-        let sock = tmp.path().join(format!("{id_str}.sock"));
-        tokio::fs::write(&sock, b"").await.unwrap();
-
-        // Insert a registry entry pointing at the exited process + fake socket.
         let config = defined_config(id, "Reaped", "reaped");
         hv.running.lock().await.insert(
             id_str.clone(),
             Arc::new(RunningVm {
                 config,
                 vnc_port: 5901,
-                qmp_socket: Some(sock.clone()),
                 process: Mutex::new(proc),
                 qmp: Mutex::new(QmpClient::dummy()),
                 bridge: Mutex::new(None),
             }),
         );
 
-        // running_states must reap: report Stopped, drop the entry, del socket.
+        // running_states must reap: report Stopped and drop the entry.
         let states = hv.running_states().await;
         assert_eq!(states.get(&id_str).copied(), Some(VmState::Stopped));
         assert!(
             !hv.running.lock().await.contains_key(&id_str),
             "exited entry must be removed from the registry"
         );
-        assert!(!sock.exists(), "QMP socket must be deleted on reap");
 
         // A second pass sees nothing (already reaped).
         assert!(hv.running_states().await.is_empty());
@@ -1541,7 +1424,6 @@ mod tests {
             Arc::new(RunningVm {
                 config: vm.clone(),
                 vnc_port: 5901,
-                qmp_socket: None,
                 process: Mutex::new(proc),
                 qmp: Mutex::new(QmpClient::dummy()),
                 bridge: Mutex::new(None),
@@ -1659,34 +1541,31 @@ mod tests {
         (id, tag)
     }
 
-    // ---- suspend is refused up-front on aarch64 + HVF (ORCHESTRATOR NOTE) ----
+    // ---- suspend is refused up-front under WHPX (hardware accel), D8 ----
     #[tokio::test]
-    async fn suspend_refused_under_hvf() {
+    async fn suspend_refused_under_hardware_accel() {
         let tmp = tempfile::tempdir().unwrap();
         let _g = crate::test_support::mock_qemu_img_full().await;
-        let hv = QemuHypervisor::with_library_dir(tmp.path().to_path_buf()).expect("build hv");
+        // Force WHPX (hardware) so the gate fires deterministically on any host.
+        let hv =
+            QemuHypervisor::with_library_dir_and_accel(tmp.path().to_path_buf(), Accelerator::Whpx)
+                .expect("build hv");
         let vm = hv
             .create_vm(defined_config(Uuid::new_v4(), "Suspendee", "suspendee"))
             .await
             .unwrap();
         let id = vm.id.to_string();
 
-        // The gate fires only on aarch64 + a hardware accelerator (HVF/KVM/WHPX).
-        // On this dev host (M4 + HVF) it fires; on a TCG host it would route to
-        // the "not running" refusal instead. Either way suspend errors here (the
-        // VM is not live), so assert the specific gate message when applicable.
-        let err = hv.suspend(&id).await.expect_err("suspend must error");
-        if std::env::consts::ARCH == "aarch64" && hv.accelerator().is_hardware() {
-            match err {
-                Error::Config(m) => assert!(
-                    m.contains("hardware acceleration (HVF)"),
-                    "expected the HVF gate message, got: {m}"
-                ),
-                other => panic!("expected Error::Config(HVF gate), got {other:?}"),
-            }
-        } else {
-            // Off the gated host the call still fails (VM not running).
-            assert!(matches!(err, Error::Config(_)), "got {err:?}");
+        let err = hv
+            .suspend(&id)
+            .await
+            .expect_err("suspend must be refused under WHPX");
+        match err {
+            Error::Config(m) => assert!(
+                m.contains("WHPX hardware acceleration"),
+                "expected the WHPX gate message, got: {m}"
+            ),
+            other => panic!("expected Error::Config(WHPX gate), got {other:?}"),
         }
         // No suspend state was captured.
         let cfg = hv.get_config(&id).await.unwrap();

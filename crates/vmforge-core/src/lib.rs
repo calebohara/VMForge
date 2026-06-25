@@ -61,6 +61,11 @@ pub(crate) mod test_support {
     /// Write a mock `qemu-img` shell script that just creates (touches) the
     /// output file, point `VMFORGE_QEMU_IMG` at it, and return the lock guard.
     /// Hold the guard until the test that needs the mock finishes.
+    ///
+    /// The mock is a `#!/bin/sh` script (Rust's `Command` can't spawn a
+    /// `.cmd`/`.bat` directly on Windows), so the tests that *run* it only pass
+    /// on a unix dev box; Windows CI compiles + lints them but executes the Rust
+    /// tests on the dev box. The function itself compiles on all platforms.
     pub async fn mock_qemu_img() -> MutexGuard<'static, ()> {
         let guard = env_guard().await;
         let dir = std::env::temp_dir().join("vmforge-mock-bin");
@@ -121,7 +126,7 @@ esac
 
     /// Like [`mock_qemu_img`] but installs the fuller mock ([`MOCK_FULL_BODY`])
     /// that handles convert/create-backing/snapshot/info — used by the Phase-3
-    /// clone and snapshot tests.
+    /// clone and snapshot tests. See [`mock_qemu_img`] re: Windows.
     pub async fn mock_qemu_img_full() -> MutexGuard<'static, ()> {
         let guard = env_guard().await;
         let dir = std::env::temp_dir().join("vmforge-mock-bin");

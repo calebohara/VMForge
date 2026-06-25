@@ -312,7 +312,6 @@ impl Library {
             },
             snapshots: Vec::new(), // snapshots NOT carried (A4)
             shared_folders: src.shared_folders.clone(),
-            guest_arch: src.guest_arch.clone(), // arch is fixed to the disk
         };
 
         // Config LAST: until this lands the dir is config-less and invisible.
@@ -374,7 +373,6 @@ impl Library {
             },
             snapshots: Vec::new(),
             shared_folders: src.shared_folders.clone(),
-            guest_arch: src.guest_arch.clone(), // arch is fixed to the disk
         };
 
         write_config_atomic(&config_path, &clone).await?;
@@ -860,7 +858,6 @@ mod tests {
             },
             snapshots: Vec::new(),
             shared_folders: Vec::new(),
-            guest_arch: None,
         }
     }
 

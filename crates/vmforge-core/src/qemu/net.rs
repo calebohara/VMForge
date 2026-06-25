@@ -69,14 +69,13 @@ fn host_bind_addr(expose_lan: bool) -> &'static str {
 pub fn network_args(
     net: &NetworkConfig,
     _accel: Accelerator,
-    host_os: &str,
 ) -> Result<Vec<String>, NetworkBuildError> {
     match net.mode {
         NetworkMode::User => user_mode_args(net),
         NetworkMode::Bridged | NetworkMode::HostOnly => {
             Err(NetworkBuildError::RequiresElevatedPermissions {
                 mode: net.mode,
-                reason: elevated_reason(net.mode, host_os),
+                reason: elevated_reason(net.mode),
             })
         }
     }
@@ -107,32 +106,21 @@ fn user_mode_args(net: &NetworkConfig) -> Result<Vec<String>, NetworkBuildError>
     Ok(vec!["-netdev".into(), netdev, "-device".into(), device])
 }
 
-/// The per-OS, user-facing reason a privileged mode is unavailable. Shared by
-/// the launch-reject path AND the capability probe so the two never drift
+/// The user-facing reason a privileged mode is unavailable. Shared by the
+/// launch-reject path AND the capability probe so the two never drift
 /// (decision A2 — say needs-permission / not-implemented, never "unsupported").
-pub(crate) fn elevated_reason(mode: NetworkMode, host_os: &str) -> String {
+pub(crate) fn elevated_reason(mode: NetworkMode) -> String {
     let label = match mode {
         NetworkMode::Bridged => "Bridged networking",
         NetworkMode::HostOnly => "Host-only networking",
         // User mode is never elevated; keep the match total defensively.
         NetworkMode::User => "User-mode networking",
     };
-    let requirement = match host_os {
-        "macos" => {
-            "requires the macOS vmnet entitlement (and elevated privileges); \
-             VMForge cannot grant it in this build yet"
-        }
-        "linux" => {
-            "requires a host TAP device and CAP_NET_ADMIN (root or setcap); \
-             VMForge cannot configure it in this build yet"
-        }
-        "windows" => {
-            "requires a configured bridged network adapter and Administrator \
-             privileges; VMForge cannot configure it in this build yet"
-        }
-        _ => "requires elevated host privileges; VMForge cannot configure it in this build yet",
-    };
-    format!("{label} {requirement}. This mode is not available in this build yet.")
+    format!(
+        "{label} requires a configured bridged network adapter and Administrator \
+         privileges; VMForge cannot configure it in this build yet. This mode is \
+         not available in this build yet."
+    )
 }
 
 /// Validate a set of port forwards. Each port must be in `1..=65535` (reject 0);
@@ -229,7 +217,7 @@ mod tests {
     #[test]
     fn hostfwd_binds_loopback_by_default() {
         let net = user_net(vec![pf(2222, 22, false, false)], None);
-        let args = network_args(&net, Accelerator::Hvf, "macos").unwrap();
+        let args = network_args(&net, Accelerator::Whpx).unwrap();
         assert_eq!(
             after(&args, "-netdev"),
             Some("user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22")
@@ -241,7 +229,7 @@ mod tests {
     #[test]
     fn expose_lan_binds_all_interfaces() {
         let net = user_net(vec![pf(2222, 22, false, true)], None);
-        let args = network_args(&net, Accelerator::Hvf, "macos").unwrap();
+        let args = network_args(&net, Accelerator::Whpx).unwrap();
         assert_eq!(
             after(&args, "-netdev"),
             Some("user,id=net0,hostfwd=tcp::2222-:22")
@@ -255,7 +243,7 @@ mod tests {
             vec![pf(5353, 53, true, false)],
             Some("52:54:00:12:34:56".into()),
         );
-        let args = network_args(&net, Accelerator::Tcg, "linux").unwrap();
+        let args = network_args(&net, Accelerator::Tcg).unwrap();
         assert_eq!(
             after(&args, "-netdev"),
             Some("user,id=net0,hostfwd=udp:127.0.0.1:5353-:53")
@@ -270,41 +258,36 @@ mod tests {
     #[test]
     fn zero_forwards_emit_bare_netdev() {
         let net = NetworkConfig::default();
-        let args = network_args(&net, Accelerator::Hvf, "macos").unwrap();
+        let args = network_args(&net, Accelerator::Whpx).unwrap();
         assert_eq!(after(&args, "-netdev"), Some("user,id=net0"));
         assert_eq!(after(&args, "-device"), Some("virtio-net-pci,netdev=net0"));
     }
 
-    // ---- bridged / host-only rejected with per-OS reason, no NAT fallback ----
+    // ---- bridged rejected with a needs-permission reason, no NAT fallback ----
     #[test]
-    fn bridged_rejected_per_os_reason() {
-        for os in ["macos", "linux", "windows"] {
-            let net = NetworkConfig {
-                mode: NetworkMode::Bridged,
-                mac: None,
-                port_forwards: vec![],
-            };
-            match network_args(&net, Accelerator::Hvf, os) {
-                Ok(args) => panic!("bridged must NOT silently fall back to NAT on {os}: {args:?}"),
-                Err(NetworkBuildError::RequiresElevatedPermissions { mode, reason }) => {
-                    assert_eq!(mode, NetworkMode::Bridged);
-                    assert!(!reason.is_empty(), "reason must be non-empty on {os}");
-                    assert!(
-                        !reason.to_lowercase().contains("unsupported"),
-                        "reason must not say 'unsupported' on {os}: {reason}"
-                    );
-                }
-                Err(other) => panic!("unexpected error variant on {os}: {other:?}"),
-            }
-        }
-        // macOS reason must mention vmnet (matches the host.rs capability probe).
+    fn bridged_rejected_with_reason() {
         let net = NetworkConfig {
             mode: NetworkMode::Bridged,
             mac: None,
             port_forwards: vec![],
         };
-        let err = network_args(&net, Accelerator::Hvf, "macos").unwrap_err();
-        assert!(err.to_string().contains("vmnet"), "macos reason: {err}");
+        match network_args(&net, Accelerator::Whpx) {
+            Ok(args) => panic!("bridged must NOT silently fall back to NAT: {args:?}"),
+            Err(NetworkBuildError::RequiresElevatedPermissions { mode, reason }) => {
+                assert_eq!(mode, NetworkMode::Bridged);
+                assert!(!reason.is_empty(), "reason must be non-empty");
+                assert!(
+                    !reason.to_lowercase().contains("unsupported"),
+                    "reason must not say 'unsupported': {reason}"
+                );
+                // The reason names the Windows requirement (matches host.rs).
+                assert!(
+                    reason.contains("Administrator"),
+                    "reason must mention the Administrator requirement: {reason}"
+                );
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
     }
 
     #[test]
@@ -314,7 +297,7 @@ mod tests {
             mac: None,
             port_forwards: vec![],
         };
-        match network_args(&net, Accelerator::Kvm, "linux") {
+        match network_args(&net, Accelerator::Tcg) {
             Ok(args) => panic!("host-only must NOT fall back to NAT: {args:?}"),
             Err(NetworkBuildError::RequiresElevatedPermissions { mode, .. }) => {
                 assert_eq!(mode, NetworkMode::HostOnly);
@@ -331,7 +314,7 @@ mod tests {
         // Surfaces through network_args as InvalidPortForward.
         let net = user_net(vec![pf(0, 22, false, false)], None);
         assert!(matches!(
-            network_args(&net, Accelerator::Hvf, "macos"),
+            network_args(&net, Accelerator::Whpx),
             Err(NetworkBuildError::InvalidPortForward(_))
         ));
     }
@@ -379,7 +362,7 @@ mod tests {
         assert!(validate_mac(injected).is_err());
         let net = user_net(vec![], Some(injected.into()));
         assert!(matches!(
-            network_args(&net, Accelerator::Hvf, "macos"),
+            network_args(&net, Accelerator::Whpx),
             Err(NetworkBuildError::InvalidMac(_))
         ));
     }

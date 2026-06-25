@@ -97,11 +97,6 @@ export interface VmConfig {
    * snapshot. A suspended VM reports `state === "stopped"` on the wire.
    */
   suspended?: boolean;
-  /**
-   * Guest CPU architecture (`"x86_64"` | `"aarch64"`). `null`/undefined = host
-   * arch. Chosen at create time and immutable thereafter.
-   */
-  guest_arch?: string | null;
 }
 
 export interface VmListItem {
@@ -118,8 +113,6 @@ export interface VmListItem {
    * VM is suspended (resume or discard), not plainly stopped.
    */
   suspended?: boolean;
-  /** Persisted guest arch (`null` = host arch). For the library badge. */
-  guest_arch?: string | null;
 }
 
 export interface CreateVmRequest {
@@ -128,11 +121,6 @@ export interface CreateVmRequest {
   disk_gib: number;
   network?: NetworkConfig | null;
   iso?: string | null;
-  /**
-   * Guest CPU architecture (`"x86_64"` | `"aarch64"`). Omit/null = host arch.
-   * A foreign arch boots under TCG emulation.
-   */
-  guest_arch?: string | null;
 }
 
 export interface UpdateVmRequest {

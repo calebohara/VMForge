@@ -1,21 +1,19 @@
-//! QEMU binary resolution (Phase 6 — D3, the critical PATH fix).
+//! QEMU binary resolution.
 //!
 //! ## Why this exists
-//! A Finder-launched macOS `.app` inherits an *empty* `launchctl getenv PATH`,
-//! so the webview process gets only `/usr/bin:/bin:/usr/sbin:/sbin`. Homebrew
-//! QEMU lives in `/opt/homebrew/bin` — disjoint from that set. Spawning QEMU by
-//! the bare name `qemu-system-aarch64` therefore fails with "not found" even
-//! though QEMU is installed and works from a shell. The fix (verified fatal
-//! otherwise) is to **resolve QEMU to an absolute path once** and use that path
-//! everywhere — probe, firmware discovery, and the actual spawn.
+//! A GUI-launched app does not always have the QEMU install directory on its
+//! `PATH`, so spawning QEMU by the bare name `qemu-system-x86_64` can fail even
+//! though QEMU is installed and works from a shell. The fix is to **resolve QEMU
+//! to an absolute path once** and use that path everywhere — probe, firmware
+//! discovery, and the actual spawn. The resolved bin dir is also prepended to
+//! the child `PATH` so QEMU can load its sibling DLLs on Windows.
 //!
 //! ## Resolution order
 //! 1. **User override** — a persisted setting (`qemu_dir` in the app config) or
 //!    the `VMFORGE_QEMU_DIR` environment variable. The "Locate QEMU…" picker in
 //!    the first-run gate writes the persisted setting.
-//! 2. **`$PATH`** — first match via a minimal cross-platform `which`.
-//! 3. **Hardcoded install prefixes** per OS (Homebrew / MacPorts / system /
-//!    MSYS2 / `C:\Program Files\qemu`).
+//! 2. **`$PATH`** — first match via a minimal `which`.
+//! 3. **Known install prefixes** — `%ProgramFiles%\qemu`, MSYS2, scoop, winget.
 //!
 //! A candidate is only accepted if `<candidate> --version` exits successfully —
 //! that rejects a 0-byte placeholder a stub installer might leave behind.
@@ -98,24 +96,10 @@ fn env_path() -> Vec<PathBuf> {
     }
 }
 
-/// Install prefixes (directories that hold QEMU binaries) per OS. These are the
-/// fallback for the empty-`PATH` launch case (the macOS Finder D3 scenario, and
-/// the equivalent on a Windows GUI launch).
+/// Install prefixes (directories that hold QEMU binaries) to search after
+/// `$PATH` — the fallback for a GUI launch whose `PATH` lacks the QEMU dir.
 fn default_prefixes() -> Vec<PathBuf> {
-    if cfg!(target_os = "macos") {
-        ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"]
-            .iter()
-            .map(PathBuf::from)
-            .collect()
-    } else if cfg!(target_os = "windows") {
-        windows_prefixes()
-    } else {
-        // Linux and other unix.
-        ["/usr/bin", "/usr/local/bin"]
-            .iter()
-            .map(PathBuf::from)
-            .collect()
-    }
+    windows_prefixes()
 }
 
 /// Windows QEMU install locations, derived from the environment so they hold

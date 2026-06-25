@@ -26,11 +26,11 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
     "createUpdaterArtifacts": false,
     "category": "DeveloperTool",
-    "shortDescription": "QEMU-based virtual machine manager.",
-    "longDescription": "VMForge is a cross-platform desktop app for creating, configuring, running, snapshotting, and managing virtual machines through a GUI, built as a management layer over QEMU.",
+    "shortDescription": "QEMU-based virtual machine manager for Windows.",
+    "longDescription": "VMForge is a Windows desktop app for creating, configuring, running, snapshotting, and managing x86-64 virtual machines through a GUI, built as a management layer over QEMU.",
     "copyright": "Copyright © 2026 VMForge contributors",
     "license": "GPL-2.0-or-later",
     "icon": [
@@ -40,17 +40,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "macOS": {
-      "minimumSystemVersion": "11.0",
-      "hardenedRuntime": true,
-      "entitlements": "entitlements.plist",
-      "signingIdentity": null,
-      "dmg": {
-        "appPosition": { "x": 180, "y": 170 },
-        "applicationFolderPosition": { "x": 480, "y": 170 },
-        "windowSize": { "width": 660, "height": 400 }
-      }
-    },
     "windows": {
       "digestAlgorithm": "sha256",
       "timestampUrl": "http://timestamp.digicert.com",
@@ -58,12 +47,6 @@
       "nsis": {
         "installMode": "perMachine"
       }
-    },
-    "linux": {
-      "deb": {
-        "depends": ["qemu-system-x86", "qemu-system-arm", "qemu-utils"]
-      },
-      "appimage": {}
     }
   },
   "plugins": {

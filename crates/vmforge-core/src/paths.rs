@@ -25,23 +25,3 @@ pub fn vm_dir(library: &Path, name: &str) -> PathBuf {
 pub fn vm_config_path(library: &Path, slug: &str) -> PathBuf {
     vm_dir(library, slug).join(CONFIG_FILENAME)
 }
-
-/// Short runtime directory for control sockets.
-///
-/// Unix-domain socket paths must fit in `sockaddr_un` (~104 bytes on macOS),
-/// so sockets must NOT live under the (potentially long) VM data dir. Prefer
-/// `$XDG_RUNTIME_DIR` (Linux), else a short `/tmp/vmforge`.
-#[cfg(unix)]
-pub fn runtime_dir() -> PathBuf {
-    if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(x).join("vmforge");
-    }
-    PathBuf::from("/tmp/vmforge")
-}
-
-/// QMP control-socket path for a VM id — kept short on purpose (see
-/// [`runtime_dir`]).
-#[cfg(unix)]
-pub fn qmp_socket_path(id: &str) -> PathBuf {
-    runtime_dir().join(format!("{id}.sock"))
-}

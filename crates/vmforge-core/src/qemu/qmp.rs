@@ -17,8 +17,6 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-#[cfg(unix)]
-use tokio::net::UnixStream;
 use tokio::time::Instant;
 
 /// One entry from QMP `query-jobs`. Extra fields are ignored.
@@ -41,13 +39,6 @@ pub struct QmpClient {
 }
 
 impl QmpClient {
-    #[cfg(unix)]
-    pub async fn connect_unix(path: &std::path::Path) -> Result<Self> {
-        let stream = UnixStream::connect(path).await?;
-        let (r, w) = stream.into_split();
-        Self::from_halves(Box::new(r), Box::new(w)).await
-    }
-
     pub async fn connect_tcp(addr: &str) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
         let (r, w) = stream.into_split();
