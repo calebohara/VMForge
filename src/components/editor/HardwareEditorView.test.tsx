@@ -32,6 +32,7 @@ function renderEditor(state: Parameters<typeof HardwareEditorView>[0]["state"]) 
         hostCores={8}
         onClose={() => {}}
         onSaved={() => {}}
+        onOpenSnapshots={() => {}}
       />
     </TooltipProvider>,
   );

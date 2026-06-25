@@ -66,14 +66,83 @@ pub(crate) mod test_support {
         let path = dir.join("mock-qemu-img.sh");
         // args: create -f qcow2 <path> <size>G  → touch <path> ($4)
         std::fs::write(&path, "#!/bin/sh\n: > \"$4\"\nexit 0\n").unwrap();
+        install_mock(&path);
+        std::env::set_var("VMFORGE_QEMU_IMG", &path);
+        guard
+    }
+
+    /// Body of a fuller mock `qemu-img` that emulates the subcommands Phase-3
+    /// clone/snapshot tests exercise:
+    /// - `create -f qcow2 <path> <size>`      → touch `<path>`
+    /// - `create -f qcow2 --backing .. <child>` → touch `<child>` (last arg)
+    /// - `convert -O qcow2 <src> <dst>`       → copy `<src>` to `<dst>` (deep)
+    /// - `snapshot -c|-a|-d <tag> <disk>`     → succeed (no-op)
+    /// - `info --output=json [-U] <disk>`     → print empty-snapshots JSON
+    ///
+    /// Pass `convert_exit` to force the convert branch to fail with that exit
+    /// code WITHOUT writing the destination (to test the toml-last invariant).
+    const MOCK_FULL_BODY: &str = r#"#!/bin/sh
+sub="$1"
+shift
+case "$sub" in
+  create)
+    # last positional arg is the output image (works for plain + --backing)
+    out=
+    for a in "$@"; do out="$a"; done
+    : > "$out"
+    exit 0
+    ;;
+  convert)
+    if [ -n "$MOCK_CONVERT_FAIL" ]; then
+      echo "mock convert forced failure" 1>&2
+      exit "$MOCK_CONVERT_FAIL"
+    fi
+    # convert -O qcow2 <src> <dst>: copy src -> dst (deep copy emulation)
+    # args after shift: -O qcow2 <src> <dst>
+    src="$3"
+    dst="$4"
+    cp "$src" "$dst"
+    exit 0
+    ;;
+  snapshot)
+    exit 0
+    ;;
+  info)
+    echo '{"format":"qcow2","virtual-size":67108864}'
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#;
+
+    /// Like [`mock_qemu_img`] but installs the fuller mock ([`MOCK_FULL_BODY`])
+    /// that handles convert/create-backing/snapshot/info — used by the Phase-3
+    /// clone and snapshot tests.
+    pub async fn mock_qemu_img_full() -> MutexGuard<'static, ()> {
+        let guard = env_guard().await;
+        let dir = std::env::temp_dir().join("vmforge-mock-bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mock-qemu-img-full.sh");
+        std::fs::write(&path, MOCK_FULL_BODY).unwrap();
+        install_mock(&path);
+        // Clear any forced-failure flag a prior test may have set.
+        std::env::remove_var("MOCK_CONVERT_FAIL");
+        std::env::set_var("VMFORGE_QEMU_IMG", &path);
+        guard
+    }
+
+    /// chmod +x on unix; no-op elsewhere.
+    fn install_mock(path: &std::path::Path) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
+            std::fs::set_permissions(path, perms).unwrap();
         }
-        std::env::set_var("VMFORGE_QEMU_IMG", &path);
-        guard
+        #[cfg(not(unix))]
+        let _ = path;
     }
 }

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Loader2, Lock, RotateCcw, Save } from "lucide-react";
+import { Camera, Loader2, Lock, RotateCcw, Save } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -65,6 +65,7 @@ export function HardwareEditorView({
   hostCores,
   onClose,
   onSaved,
+  onOpenSnapshots,
 }: {
   vmId: string;
   /** Live state from the library poll; gates whether fields are editable. */
@@ -73,6 +74,8 @@ export function HardwareEditorView({
   onClose: () => void;
   /** Called after a successful save (parent refreshes + returns to library). */
   onSaved: () => void;
+  /** Switch to this VM's snapshot manager. */
+  onOpenSnapshots: () => void;
 }) {
   const [original, setOriginal] = useState<VmConfig | null>(null);
   const [draft, setDraft] = useState<EditorDraft | null>(null);
@@ -173,6 +176,14 @@ export function HardwareEditorView({
             <CardTitle className="mr-auto truncate" title={draft.name}>
               Edit hardware
             </CardTitle>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onOpenSnapshots}
+              disabled={saving}
+            >
+              <Camera className="h-4 w-4" /> Snapshots
+            </Button>
             <StatusBadge state={state} />
           </div>
           {locked && (

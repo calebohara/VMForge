@@ -42,6 +42,11 @@ pub fn run() {
             commands::force_off,
             commands::pause_vm,
             commands::resume_vm,
+            commands::list_snapshots,
+            commands::create_snapshot,
+            commands::restore_snapshot,
+            commands::delete_snapshot,
+            commands::clone_vm,
         ])
         .run(tauri::generate_context!())
         .expect("error while running VMForge");

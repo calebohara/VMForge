@@ -100,6 +100,23 @@ export interface UpdateVmRequest {
   iso?: string | null;
 }
 
+// ---- Phase 3 snapshot / clone types (mirror SnapshotDto, snake_case) ----
+
+export interface Snapshot {
+  snapshot_id: string;
+  name: string;
+  /** Parent snapshot id (`null` => top-level). */
+  parent_id: string | null;
+  created_at: string;
+  /** True when RAM was captured (a live snapshot). */
+  has_vm_state: boolean;
+  vm_state_size: number;
+  /** False when our metadata references a snapshot missing from the qcow2. */
+  present_in_qcow2: boolean;
+}
+
+export type CloneKind = "full" | "linked";
+
 // ---- Phase 1 wrappers (kept) ----
 
 export const probeHost = () => invoke<HostCapabilities>("probe_host");
@@ -123,3 +140,16 @@ export const deleteVm = (id: string, delete_disks: boolean) =>
 export const startVm = (id: string) => invoke<void>("start_vm", { id });
 export const renameVm = (id: string, new_name: string) =>
   invoke<VmConfig>("rename_vm", { id, new_name });
+
+// ---- Phase 3 snapshot / clone wrappers (snake_case arg keys) ----
+
+export const listSnapshots = (id: string) =>
+  invoke<Snapshot[]>("list_snapshots", { id });
+export const createSnapshot = (id: string, name: string) =>
+  invoke<Snapshot>("create_snapshot", { id, name });
+export const restoreSnapshot = (id: string, snapshot_id: string) =>
+  invoke<void>("restore_snapshot", { id, snapshot_id });
+export const deleteSnapshot = (id: string, snapshot_id: string) =>
+  invoke<void>("delete_snapshot", { id, snapshot_id });
+export const cloneVm = (id: string, new_name: string, linked: boolean) =>
+  invoke<VmConfig>("clone_vm", { id, new_name, linked });

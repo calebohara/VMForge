@@ -44,6 +44,41 @@ pub enum VmState {
     Error,
 }
 
+/// One node in the VMForge snapshot tree. This is OUR overlay metadata,
+/// persisted in `vmforge.toml`; qcow2 internal snapshots remain authoritative
+/// for existence and payload. Join key: the qcow2 `tag` equals this snapshot's
+/// `id.to_string()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    /// Stable id AND qcow2 tag (`id.to_string()`).
+    pub id: Uuid,
+    pub name: String,
+    /// Parent snapshot id; `None` => a top-level (tree-root) snapshot.
+    #[serde(default)]
+    pub parent: Option<Uuid>,
+    /// RFC3339 UTC timestamp of creation.
+    pub created_at: String,
+    /// `true` when RAM/device state was captured (a live snapshot).
+    #[serde(default)]
+    pub has_vm_state: bool,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub vm_state_size: u64,
+}
+
+/// A reconciled snapshot node: our metadata plus presence in the qcow2 image
+/// and the resolved child links. Produced on-demand by the read path, never
+/// persisted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotNode {
+    #[serde(flatten)]
+    pub meta: Snapshot,
+    /// Whether an internal qcow2 snapshot with this tag currently exists.
+    pub present_in_qcow2: bool,
+    pub children: Vec<Uuid>,
+}
+
 /// Full persisted configuration for one VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmConfig {
@@ -69,6 +104,10 @@ pub struct VmConfig {
     pub iso: Option<String>,
     #[serde(default)]
     pub metadata: VmMetadata,
+    /// VMForge snapshot-tree overlay metadata. Phase-2 configs load with an
+    /// empty array (additive, no schema bump).
+    #[serde(default)]
+    pub snapshots: Vec<Snapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -49,6 +49,14 @@ cargo check --workspace
   slug-addressed dirs). Live status via `list_vms` polling with a natural-exit
   reaper. Adversarially reviewed; 9 confirmed findings fixed (2 critical IPC
   arg-key bugs, a reaper race, path-traversal + `-drive` injection hardening).
+- **Phase 3 (snapshots & clones) — functional & verified.** Snapshot tree
+  (metadata overlay in `vmforge.toml`), **live** snapshots via QMP
+  `snapshot-save`/`-delete` jobs and **offline** via `qemu-img`, disk-only
+  restore, and **full + linked clones** with linked-parent protection. Verified
+  by gated real-host tests (actual `qemu-img` snapshot/clone + a live QMP
+  `snapshot-save` on a booted guest). Adversarially reviewed; 10 confirmed
+  findings fixed (snapshot TOCTOU/lost-update, a multi-disk regression, clone
+  path-traversal hardening).
 
 Run the app with `npm run tauri dev`, then Browse to an ISO and **Create &
 start**. See [`CLAUDE.md`](CLAUDE.md) for architecture, conventions, pinned

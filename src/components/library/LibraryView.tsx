@@ -7,6 +7,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { VmCard } from "@/components/library/VmCard";
 import { EmptyLibrary } from "@/components/library/EmptyLibrary";
 import { DeleteVmDialog } from "@/components/library/DeleteVmDialog";
+import { CloneVmDialog } from "@/components/snapshots/CloneVmDialog";
 import type { VmActions } from "@/components/library/QuickActions";
 import type { HostCapabilities, VmListItem } from "@/lib/ipc";
 
@@ -19,6 +20,11 @@ export interface LibraryViewProps {
   onCreate: () => void;
   /** Called when delete is confirmed in the dialog. */
   onConfirmDelete: (id: string, deleteDisks: boolean) => void;
+  /**
+   * Called when a clone is confirmed. Resolves on completion so the dialog can
+   * keep its "Cloning…" spinner up for the full synchronous op (spec §D5).
+   */
+  onConfirmClone: (id: string, newName: string, linked: boolean) => Promise<void>;
 }
 
 /**
@@ -34,13 +40,28 @@ export function LibraryView({
   actions,
   onCreate,
   onConfirmDelete,
+  onConfirmClone,
 }: LibraryViewProps) {
   const [pendingDelete, setPendingDelete] = useState<VmListItem | null>(null);
+  const [pendingClone, setPendingClone] = useState<VmListItem | null>(null);
+  const [cloning, setCloning] = useState(false);
 
-  // Intercept delete to open the confirmation dialog locally.
+  // Intercept delete + clone to open the local dialogs.
   const wrappedActions: VmActions = {
     ...actions,
     onDelete: (vm) => setPendingDelete(vm),
+    onClone: (vm) => setPendingClone(vm),
+  };
+
+  const confirmClone = async (newName: string, linked: boolean) => {
+    if (!pendingClone) return;
+    setCloning(true);
+    try {
+      await onConfirmClone(pendingClone.id, newName, linked);
+      setPendingClone(null);
+    } finally {
+      setCloning(false);
+    }
   };
 
   return (
@@ -106,6 +127,19 @@ export function LibraryView({
           setPendingDelete(null);
           onConfirmDelete(id, deleteDisks);
         }}
+      />
+
+      <CloneVmDialog
+        open={pendingClone != null}
+        sourceName={pendingClone?.name ?? ""}
+        busy={cloning}
+        onCancel={() => setPendingClone(null)}
+        onConfirm={(newName, linked) =>
+          // confirmClone rethrows on failure (to keep the dialog open); the
+          // error is already toasted upstream, so swallow it here to avoid an
+          // unhandled promise rejection.
+          void confirmClone(newName, linked).catch(() => {})
+        }
       />
     </div>
   );

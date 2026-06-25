@@ -93,4 +93,44 @@ describe("ipc wrappers call invoke with the exact command + arg shape", () => {
     ipc.resumeVm("a");
     expect(invoke).toHaveBeenLastCalledWith("resume_vm", { id: "a" });
   });
+
+  // ---- Phase 3 snapshot / clone wrappers ----
+
+  it("listSnapshots passes { id }", () => {
+    ipc.listSnapshots("abc");
+    expect(invoke).toHaveBeenCalledWith("list_snapshots", { id: "abc" });
+  });
+
+  it("createSnapshot passes { id, name }", () => {
+    ipc.createSnapshot("abc", "Before update");
+    expect(invoke).toHaveBeenCalledWith("create_snapshot", {
+      id: "abc",
+      name: "Before update",
+    });
+  });
+
+  it("restoreSnapshot passes snake_case { id, snapshot_id }", () => {
+    ipc.restoreSnapshot("abc", "snap-1");
+    expect(invoke).toHaveBeenCalledWith("restore_snapshot", {
+      id: "abc",
+      snapshot_id: "snap-1",
+    });
+  });
+
+  it("deleteSnapshot passes snake_case { id, snapshot_id }", () => {
+    ipc.deleteSnapshot("abc", "snap-1");
+    expect(invoke).toHaveBeenCalledWith("delete_snapshot", {
+      id: "abc",
+      snapshot_id: "snap-1",
+    });
+  });
+
+  it("cloneVm passes snake_case { id, new_name, linked }", () => {
+    ipc.cloneVm("abc", "Clone", true);
+    expect(invoke).toHaveBeenCalledWith("clone_vm", {
+      id: "abc",
+      new_name: "Clone",
+      linked: true,
+    });
+  });
 });

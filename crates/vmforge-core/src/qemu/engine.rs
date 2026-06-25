@@ -8,17 +8,23 @@
 use crate::error::{Error, Result};
 use crate::host::{self, Accelerator};
 use crate::hypervisor::Hypervisor;
-use crate::library::Library;
-use crate::model::{VmConfig, VmId, VmState, VmSummary};
+use crate::library::{self, Library};
+use crate::model::{Snapshot, SnapshotNode, VmConfig, VmId, VmState, VmSummary};
 use crate::qemu::args::{build_args, QemuLaunch, QmpEndpoint};
 use crate::qemu::{firmware, process::QemuProcess, qmp::QmpClient};
 use async_trait::async_trait;
+use serde_json::json;
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use uuid::Uuid;
+
+/// Timeout bounding a single live QMP snapshot job (save/load/delete). RAM
+/// capture can be slow on a large guest, so this is generous.
+const SNAPSHOT_JOB_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How the QMP channel for a given VM is bound. Unix socket where available,
 /// TCP loopback on Windows.
@@ -153,10 +159,17 @@ impl QemuHypervisor {
                 states.insert(id.clone(), VmState::Stopped);
                 reap.push((id, vm));
             } else {
-                // Reflect the live QMP status; fall back to Running if the
-                // query fails transiently (the process is alive).
-                let mut qmp = vm.qmp.lock().await;
-                let st = qmp.query_status().await.unwrap_or(VmState::Running);
+                // Reflect the live QMP status, but never BLOCK on the per-VM QMP
+                // channel: a long live snapshot job (snapshot-save/-load/-delete)
+                // holds `vm.qmp` for its whole duration, and blocking here would
+                // freeze the 2s library poll for every VM (override #1). Use a
+                // non-blocking `try_lock`; on contention the process is already
+                // confirmed alive (try_wait above), so report Running. A failed
+                // query also falls back to Running.
+                let st = match vm.qmp.try_lock() {
+                    Ok(mut qmp) => qmp.query_status().await.unwrap_or(VmState::Running),
+                    Err(_) => VmState::Running,
+                };
                 states.insert(id, st);
             }
         }
@@ -285,13 +298,17 @@ impl QemuHypervisor {
         self.library.load_config(&parsed).await
     }
 
-    /// Delete a persisted VM. Rejected if live; also clears any stale QMP
-    /// socket for the id.
+    /// Delete a persisted VM. Rejected if live; rejected if it is a linked-clone
+    /// parent (A5 — deleting it would orphan its children's backing); also
+    /// clears any stale QMP socket for the id.
     pub async fn delete(&self, id: &str, delete_disks: bool) -> Result<()> {
         // Hold start_lock across the live-check + delete so a concurrent `start`
         // can't launch the VM whose directory we're about to remove.
         let _g = self.start_lock.lock().await;
         self.reject_if_live(id, "delete").await?;
+        // Parent-protection: never remove a disk that a linked clone backs onto.
+        let config = self.get_config(id).await?;
+        self.reject_if_has_dependents(&config, "delete").await?;
         let parsed = parse_id(id)?;
         self.library.delete_vm(&parsed, delete_disks).await?;
         #[cfg(unix)]
@@ -319,6 +336,248 @@ impl QemuHypervisor {
             ))),
         }
     }
+
+    // ---- snapshots & clones (Phase 3) ----
+
+    /// Absolute path to the VM's single disk, plus the loaded config. Phase-3
+    /// snapshot/clone scope is single-disk: anything else is
+    /// [`Error::NotImplemented`].
+    async fn single_disk_path(&self, config: &VmConfig) -> Result<PathBuf> {
+        match config.disks.as_slice() {
+            [d] => Ok(crate::paths::vm_dir(&self.library_dir, &config.dir_slug).join(&d.path)),
+            [] => Err(Error::Config(format!("VM {} has no disks", config.name))),
+            _ => Err(Error::NotImplemented("multi-disk snapshots")),
+        }
+    }
+
+    /// Refuse the op if `config` is a linked-clone parent — i.e. any other
+    /// persisted VM has a disk backing that resolves to this VM's disk (A5).
+    async fn reject_if_has_dependents(&self, config: &VmConfig, action: &str) -> Result<()> {
+        // Scan EVERY disk (not just single-disk VMs) — routing this through
+        // single_disk_path would wrongly fail start/delete of a 0- or
+        // multi-disk VM (Phase 1/2 regression). A diskless VM has no dependents.
+        let vm_dir = crate::paths::vm_dir(&self.library_dir, &config.dir_slug);
+        let mut deps: Vec<String> = Vec::new();
+        for d in &config.disks {
+            deps.extend(self.library.dependents_of(&vm_dir.join(&d.path)).await?);
+        }
+        deps.sort();
+        deps.dedup();
+        if deps.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Config(format!(
+                "cannot {action} VM {}: it has linked clones ({}); delete or full-clone them first",
+                config.name,
+                deps.join(", ")
+            )))
+        }
+    }
+
+    /// Create a snapshot. Routing (A3) is decided atomically under `start_lock`:
+    /// a live VM (Running/Paused) uses a QMP `snapshot-save` job (RAM captured),
+    /// a stopped/defined VM uses an offline `qemu-img snapshot -c` (disk only).
+    /// Transient states (Starting/Stopping/Error) are refused with
+    /// [`Error::Config`]. The job runs on `vm.qmp` WITHOUT holding the `running`
+    /// registry lock. Single-disk only.
+    pub async fn create_snapshot(
+        &self,
+        id: &str,
+        name: &str,
+        parent: Option<Uuid>,
+        notes: &str,
+    ) -> Result<Snapshot> {
+        let pre = self.get_config(id).await?;
+        let disk = self.single_disk_path(&pre).await?;
+
+        let snap_id = Uuid::new_v4();
+        let tag = snap_id.to_string();
+
+        // Decide live-vs-offline AND execute under start_lock so a concurrent
+        // start can't race the check→route→exec against the open image (A3).
+        // The OFFLINE qemu-img exec stays under the lock; only the (potentially
+        // multi-minute) LIVE QMP job releases it so it never blocks other VMs.
+        let guard = self.start_lock.lock().await;
+        let route = self.snapshot_route(id, "snapshot").await?;
+        let has_vm_state = match route {
+            SnapshotRoute::Live(vm) => {
+                drop(guard);
+                // QEMU job IDs must start with a letter; a raw UUID often starts
+                // with a digit. Ephemeral letter-prefixed job id — the qcow2
+                // `tag` stays the snapshot's stable UUID.
+                let job_id = format!("vmforge-{}", Uuid::new_v4());
+                let mut qmp = vm.qmp.lock().await;
+                qmp.run_job(
+                    "snapshot-save",
+                    json!({
+                        "job-id": job_id.clone(),
+                        "tag": tag,
+                        "vmstate": "disk0",
+                        "devices": ["disk0"],
+                    }),
+                    &job_id,
+                    SNAPSHOT_JOB_TIMEOUT,
+                )
+                .await?;
+                true
+            }
+            SnapshotRoute::Offline => {
+                crate::storage::snapshot_create_offline(&disk, &tag).await?;
+                drop(guard);
+                false
+            }
+        };
+
+        let snapshot = Snapshot {
+            id: snap_id,
+            name: name.to_string(),
+            parent,
+            created_at: library::now_rfc3339(),
+            has_vm_state,
+            notes: notes.to_string(),
+            vm_state_size: 0,
+        };
+        // Re-read a FRESH config (a concurrent rename/edit may have persisted
+        // during a long live job) and apply only the snapshot delta — never
+        // write back the stale pre-job snapshot (lost-update guard).
+        let mut config = self.get_config(id).await?;
+        config.snapshots.push(snapshot.clone());
+        self.library.save_config(&config).await?;
+        Ok(snapshot)
+    }
+
+    /// Delete a snapshot, routing live/offline like [`create_snapshot`], then
+    /// re-parenting any children of the removed node onto its grandparent and
+    /// persisting. A snapshot missing from our metadata maps to
+    /// [`Error::Config`].
+    pub async fn delete_snapshot(&self, id: &str, snapshot_id: Uuid) -> Result<()> {
+        let pre = self.get_config(id).await?;
+        let disk = self.single_disk_path(&pre).await?;
+        if !pre.snapshots.iter().any(|s| s.id == snapshot_id) {
+            return Err(Error::Config(format!(
+                "snapshot {snapshot_id} not found on VM {id}"
+            )));
+        }
+        let tag = snapshot_id.to_string();
+
+        // Same lock discipline as create_snapshot: offline exec under start_lock,
+        // live job releases it.
+        let guard = self.start_lock.lock().await;
+        let route = self.snapshot_route(id, "delete snapshot").await?;
+        match route {
+            SnapshotRoute::Live(vm) => {
+                drop(guard);
+                // QEMU job IDs must start with a letter (see create_snapshot).
+                let job_id = format!("vmforge-{}", Uuid::new_v4());
+                let mut qmp = vm.qmp.lock().await;
+                qmp.run_job(
+                    "snapshot-delete",
+                    json!({
+                        "job-id": job_id.clone(),
+                        "tag": tag,
+                        "devices": ["disk0"],
+                    }),
+                    &job_id,
+                    SNAPSHOT_JOB_TIMEOUT,
+                )
+                .await?;
+            }
+            SnapshotRoute::Offline => {
+                crate::storage::snapshot_delete_offline(&disk, &tag).await?;
+                drop(guard);
+            }
+        }
+
+        // Fresh re-read before mutate+persist (lost-update guard).
+        let mut config = self.get_config(id).await?;
+        library::reparent_on_delete(&mut config.snapshots, snapshot_id);
+        self.library.save_config(&config).await?;
+        Ok(())
+    }
+
+    /// Restore a snapshot. Phase-3 scope reverts the DISK ONLY (A7) via
+    /// `qemu-img snapshot -a`, so it is **stopped-only**: a live VM is refused
+    /// (`reject_if_live`). Parent-protection (A5) also applies — a VM with
+    /// linked children may not be reverted out from under them. Held under
+    /// `start_lock` so the check-and-apply is atomic against a concurrent start.
+    pub async fn restore_snapshot(&self, id: &str, snapshot_id: Uuid) -> Result<()> {
+        let _g = self.start_lock.lock().await;
+        self.reject_if_live(id, "restore a snapshot of").await?;
+
+        let config = self.get_config(id).await?;
+        self.reject_if_has_dependents(&config, "restore a snapshot of")
+            .await?;
+        if !config.snapshots.iter().any(|s| s.id == snapshot_id) {
+            return Err(Error::Config(format!(
+                "snapshot {snapshot_id} not found on VM {id}"
+            )));
+        }
+        let disk = self.single_disk_path(&config).await?;
+        crate::storage::snapshot_apply_offline(&disk, &snapshot_id.to_string()).await?;
+        Ok(())
+    }
+
+    /// The reconciled snapshot tree for a VM: our metadata joined against the
+    /// image's internal qcow2 snapshots. The image is read with
+    /// `--force-share` (`-U`) iff the VM is running, so we never error on a
+    /// QEMU-held image (A3 offline read path).
+    pub async fn list_snapshots(&self, id: &str) -> Result<Vec<SnapshotNode>> {
+        let config = self.get_config(id).await?;
+        let disk = self.single_disk_path(&config).await?;
+        let is_running = self.is_running(id).await;
+        let stdout = crate::storage::info_json(&disk, is_running).await?;
+        let qcow2 = crate::storage::parse_info_snapshots(&stdout)?;
+        Ok(library::reconcile(&config.snapshots, &qcow2))
+    }
+
+    /// Clone a VM into a brand-new VM (A4). Stopped-source-only
+    /// (`reject_if_live`); delegates the disk work to the library. Held under
+    /// `start_lock` so the source can't be launched mid-clone.
+    pub async fn clone_vm(&self, id: &str, new_name: &str, linked: bool) -> Result<VmConfig> {
+        let _g = self.start_lock.lock().await;
+        self.reject_if_live(id, "clone").await?;
+        let src_id = parse_id(id)?;
+        if linked {
+            self.library.linked_clone(&src_id, new_name).await
+        } else {
+            self.library.full_clone(&src_id, new_name).await
+        }
+    }
+
+    /// Whether `id` is currently in a non-stopped live state (reaper-aware).
+    async fn is_running(&self, id: &str) -> bool {
+        !matches!(
+            self.running_state(id).await,
+            None | Some(VmState::Stopped) | Some(VmState::Defined)
+        )
+    }
+
+    /// Decide the snapshot route under the caller-held `start_lock`. Returns the
+    /// live `Arc<RunningVm>` for Running/Paused, `Offline` for Stopped/Defined,
+    /// and refuses transient states with [`Error::Config`] (A3). Reaping is
+    /// applied via `running_state`.
+    async fn snapshot_route(&self, id: &str, action: &str) -> Result<SnapshotRoute> {
+        match self.running_state(id).await {
+            None | Some(VmState::Stopped) | Some(VmState::Defined) => Ok(SnapshotRoute::Offline),
+            Some(VmState::Running) | Some(VmState::Paused) => {
+                // The VM is live and in the registry; fetch its handle for the
+                // QMP job. (running_state already reaped a dead process.)
+                let vm = self.get(id).await?;
+                Ok(SnapshotRoute::Live(vm))
+            }
+            Some(state) => Err(Error::Config(format!(
+                "cannot {action} VM {id} while it is {state:?}; wait for it to settle"
+            ))),
+        }
+    }
+}
+
+/// Routing decision for a snapshot create/delete (A3).
+enum SnapshotRoute {
+    /// Live VM — drive the op as a QMP job on this handle's `qmp` channel.
+    Live(Arc<RunningVm>),
+    /// Stopped/Defined VM — drive the op with the offline `qemu-img` runner.
+    Offline,
 }
 
 /// Parse an id string into a [`VmId`], mapping a bad id to [`Error::VmNotFound`].
@@ -347,6 +606,14 @@ impl Hypervisor for QemuHypervisor {
 
         if self.running.lock().await.contains_key(&id) {
             return Err(Error::Config(format!("VM {id} is already running")));
+        }
+
+        // Parent-protection (A5): refuse to boot a VM that backs a linked clone
+        // — opening its disk RW would corrupt the children's CoW backing. Only
+        // checked for library-managed VMs (those with a slug); hand-built
+        // configs that never went through the library have no dependents.
+        if !config.dir_slug.is_empty() {
+            self.reject_if_has_dependents(config, "start").await?;
         }
 
         // Directory is slug-addressed (Phase 2). Fall back to the name only for
@@ -566,6 +833,7 @@ mod tests {
             display: Default::default(),
             iso: None,
             metadata: Default::default(),
+            snapshots: Vec::new(),
         }
     }
 
@@ -648,5 +916,209 @@ mod tests {
         // A second pass sees nothing (already reaped).
         assert!(hv.running_states().await.is_empty());
         assert!(hv.running_state(&id_str).await.is_none());
+    }
+
+    // ====================================================================
+    // Phase 3 — snapshots, clones, parent-protection
+    // ====================================================================
+
+    /// Persist a parent VM and a linked clone of it through the library, using
+    /// the fuller mock binary. Returns (hv, parent_config, child_config). The
+    /// returned MutexGuard keeps the mock env seam alive for the test.
+    async fn parent_with_linked_child(
+        tmp: &tempfile::TempDir,
+    ) -> (QemuHypervisor, VmConfig, VmConfig) {
+        let hv = QemuHypervisor::with_library_dir(tmp.path().to_path_buf()).expect("build hv");
+        let parent = hv
+            .create_vm(defined_config(Uuid::new_v4(), "Parent", "parent"))
+            .await
+            .unwrap();
+        let child = hv
+            .clone_vm(&parent.id.to_string(), "Child", true)
+            .await
+            .unwrap();
+        (hv, parent, child)
+    }
+
+    // ---- parent-protection: delete a linked-clone parent is refused ----
+    #[tokio::test]
+    async fn parent_protection_refuses_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let (hv, parent, _child) = parent_with_linked_child(&tmp).await;
+
+        let err = hv
+            .delete(&parent.id.to_string(), true)
+            .await
+            .expect_err("deleting a parent with a linked child must fail");
+        assert!(matches!(err, Error::Config(_)), "got {err:?}");
+        // Parent still present.
+        assert!(hv.get_config(&parent.id.to_string()).await.is_ok());
+    }
+
+    // ---- parent-protection: start a linked-clone parent is refused ----
+    #[tokio::test]
+    async fn parent_protection_refuses_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let (hv, parent, _child) = parent_with_linked_child(&tmp).await;
+
+        let err = hv
+            .start(&parent)
+            .await
+            .expect_err("starting a parent with a linked child must fail");
+        assert!(matches!(err, Error::Config(_)), "got {err:?}");
+        // No process was registered.
+        assert!(hv.running_state(&parent.id.to_string()).await.is_none());
+    }
+
+    // ---- parent-protection: restore a snapshot of a parent is refused ----
+    #[tokio::test]
+    async fn parent_protection_refuses_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let (hv, parent, _child) = parent_with_linked_child(&tmp).await;
+
+        // Give the parent an (offline) snapshot to attempt to restore.
+        let snap = hv
+            .create_snapshot(&parent.id.to_string(), "base", None, "")
+            .await
+            .unwrap();
+
+        let err = hv
+            .restore_snapshot(&parent.id.to_string(), snap.id)
+            .await
+            .expect_err("restoring a parent with a linked child must fail");
+        assert!(matches!(err, Error::Config(_)), "got {err:?}");
+    }
+
+    // ---- offline snapshot create + delete round-trip persists metadata ----
+    #[tokio::test]
+    async fn offline_snapshot_create_and_delete_persist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let hv =
+            QemuHypervisor::with_library_dir(tmp.path().to_path_buf()).expect("build hypervisor");
+        let vm = hv
+            .create_vm(defined_config(Uuid::new_v4(), "Solo", "solo"))
+            .await
+            .unwrap();
+        let id = vm.id.to_string();
+
+        // Create (offline, since the VM is not running) → has_vm_state == false.
+        let snap = hv
+            .create_snapshot(&id, "first", None, "note")
+            .await
+            .unwrap();
+        assert!(!snap.has_vm_state, "offline snapshot has no RAM state");
+        let cfg = hv.get_config(&id).await.unwrap();
+        assert_eq!(cfg.snapshots.len(), 1);
+        assert_eq!(cfg.snapshots[0].name, "first");
+
+        // Delete → metadata removed and persisted.
+        hv.delete_snapshot(&id, snap.id).await.unwrap();
+        let cfg = hv.get_config(&id).await.unwrap();
+        assert!(
+            cfg.snapshots.is_empty(),
+            "snapshot metadata must be removed"
+        );
+
+        // Deleting an unknown snapshot is a Config error.
+        let err = hv.delete_snapshot(&id, Uuid::new_v4()).await.unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "got {err:?}");
+    }
+
+    // ---- list_snapshots reconciles metadata against the (mock) image ----
+    #[tokio::test]
+    async fn list_snapshots_reconciles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let hv =
+            QemuHypervisor::with_library_dir(tmp.path().to_path_buf()).expect("build hypervisor");
+        let vm = hv
+            .create_vm(defined_config(Uuid::new_v4(), "Solo", "solo"))
+            .await
+            .unwrap();
+        let id = vm.id.to_string();
+        let snap = hv.create_snapshot(&id, "first", None, "").await.unwrap();
+
+        // The mock `info` returns no internal snapshots, so our metadata entry
+        // reconciles as a metadata-orphan (present_in_qcow2 == false).
+        let nodes = hv.list_snapshots(&id).await.unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].meta.id, snap.id);
+        assert!(!nodes[0].present_in_qcow2);
+    }
+
+    // ---- multi-disk snapshots/clones are NotImplemented ----
+    #[tokio::test]
+    async fn multi_disk_snapshot_is_not_implemented() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let hv =
+            QemuHypervisor::with_library_dir(tmp.path().to_path_buf()).expect("build hypervisor");
+        let mut cfg = defined_config(Uuid::new_v4(), "Multi", "multi");
+        cfg.disks.push(DiskSpec {
+            path: "disk2.qcow2".into(),
+            size_gib: 2,
+            backing: None,
+        });
+        let vm = hv.create_vm(cfg).await.unwrap();
+        let id = vm.id.to_string();
+
+        assert!(matches!(
+            hv.create_snapshot(&id, "x", None, "").await.unwrap_err(),
+            Error::NotImplemented(_)
+        ));
+        assert!(matches!(
+            hv.list_snapshots(&id).await.unwrap_err(),
+            Error::NotImplemented(_)
+        ));
+    }
+
+    // ---- state refusal: restore/clone refused while the VM is live ----
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_state_refuses_restore_and_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let hv =
+            QemuHypervisor::with_library_dir(tmp.path().to_path_buf()).expect("build hypervisor");
+        let vm = hv
+            .create_vm(defined_config(Uuid::new_v4(), "Live", "live"))
+            .await
+            .unwrap();
+        let id = vm.id.to_string();
+        // Give it a snapshot entry to attempt to restore.
+        let snap = hv.create_snapshot(&id, "base", None, "").await.unwrap();
+
+        // Insert a registry entry whose process stays alive (so the reaper sees
+        // it running) with a dummy QMP (query fails → falls back to Running).
+        let log = tmp.path().join("proc.log");
+        let proc = QemuProcess::spawn("/bin/sh", &["-c".into(), "sleep 30".into()], &log)
+            .await
+            .expect("spawn sleeper");
+        hv.running.lock().await.insert(
+            id.clone(),
+            Arc::new(RunningVm {
+                config: vm.clone(),
+                vnc_port: 5901,
+                qmp_socket: None,
+                process: Mutex::new(proc),
+                qmp: Mutex::new(QmpClient::dummy()),
+                bridge: Mutex::new(None),
+            }),
+        );
+
+        // Restore is stopped-only (A7) → refused while live.
+        let err = hv.restore_snapshot(&id, snap.id).await.unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "restore: got {err:?}");
+
+        // Clone is stopped-source-only → refused while live.
+        let err = hv.clone_vm(&id, "Copy", false).await.unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "clone: got {err:?}");
+
+        // Clean up the sleeper.
+        let _ = hv.kill(&id).await;
     }
 }

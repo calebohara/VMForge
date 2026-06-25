@@ -149,8 +149,10 @@ VMForge/
   `vmforge.toml` + directory-scanned library, hardware editor (edit while
   stopped), live status via `list_vms` polling (events deferred to Phase 3).
   See [`docs/phase2-spec.md`](docs/phase2-spec.md).
-- **Phase 3 — Snapshots & clones.** Snapshot tree UI, live + offline
-  snapshots, restore, full/linked clones.
+- **Phase 3 — Snapshots & clones.** ✅ Snapshot tree (overlay in `vmforge.toml`),
+  live (QMP `snapshot-save`/`-delete` jobs) + offline (`qemu-img`) snapshots,
+  disk-only restore (live RAM-restore deferred), full + linked clones with
+  parent-protection. See [`docs/phase3-spec.md`](docs/phase3-spec.md).
 - **Phase 4 — Networking modes.** Bridged + host-only (elevated-permissions
   flow), NAT port forwarding.
 - **Phase 5 — Workstation niceties.** SPICE (clipboard, dynamic res, USB

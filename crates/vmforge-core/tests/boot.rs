@@ -51,6 +51,7 @@ async fn boots_real_guest_and_controls_via_qmp() {
         display: Default::default(),
         iso: Some(iso),
         metadata: Default::default(),
+        snapshots: Vec::new(),
     };
     let created = creator.create_vm(draft).await.expect("persist VM");
     let id = created.id.to_string();

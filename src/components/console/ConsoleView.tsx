@@ -1,4 +1,4 @@
-import { Pause, Play, Power, Square } from "lucide-react";
+import { Camera, Pause, Play, Power, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/common/StatusBadge";
 import { VncConsole } from "@/components/VncConsole";
@@ -20,6 +20,7 @@ export function ConsoleView({
   onShutdown,
   onForceOff,
   onBack,
+  onOpenSnapshots,
 }: {
   name: string;
   wsPort: number;
@@ -30,6 +31,8 @@ export function ConsoleView({
   onShutdown: () => void;
   onForceOff: () => void;
   onBack: () => void;
+  /** Switch to this VM's snapshot manager. */
+  onOpenSnapshots: () => void;
 }) {
   const showConsole =
     state === "running" || state === "paused" || state === "starting";
@@ -41,6 +44,9 @@ export function ConsoleView({
           {name}
         </span>
         <StatusBadge state={state} />
+        <Button size="sm" variant="outline" onClick={onOpenSnapshots}>
+          <Camera className="h-4 w-4" /> Snapshot
+        </Button>
         {state === "paused" ? (
           <Button size="sm" variant="outline" disabled={busy} onClick={onResume}>
             <Play className="h-4 w-4" /> Resume

@@ -13,7 +13,7 @@ use tauri::State;
 use uuid::Uuid;
 use vmforge_core::host::{self, Accelerator, HostCapabilities};
 use vmforge_core::model::{
-    DiskSpec, Hardware, NetworkConfig, NetworkMode, PortForward, VmConfig, VmState,
+    DiskSpec, Hardware, NetworkConfig, NetworkMode, PortForward, SnapshotNode, VmConfig, VmState,
 };
 use vmforge_core::{Hypervisor, QemuHypervisor};
 
@@ -90,6 +90,17 @@ pub struct VmListItem {
     pub iso: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotDto {
+    pub snapshot_id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    pub created_at: String,
+    pub has_vm_state: bool,
+    pub vm_state_size: u64,
+    pub present_in_qcow2: bool,
+}
+
 // ---- DTO <-> model conversions ----
 
 impl From<HardwareDto> for Hardware {
@@ -153,6 +164,20 @@ impl From<VmConfig> for VmConfigDto {
     }
 }
 
+impl From<SnapshotNode> for SnapshotDto {
+    fn from(n: SnapshotNode) -> Self {
+        SnapshotDto {
+            snapshot_id: n.meta.id.to_string(),
+            name: n.meta.name,
+            parent_id: n.meta.parent.map(|p| p.to_string()),
+            created_at: n.meta.created_at,
+            has_vm_state: n.meta.has_vm_state,
+            vm_state_size: n.meta.vm_state_size,
+            present_in_qcow2: n.present_in_qcow2,
+        }
+    }
+}
+
 /// Probe host virtualization capabilities (first-run screen).
 #[tauri::command]
 pub async fn probe_host() -> Result<HostCapabilities, String> {
@@ -184,6 +209,7 @@ pub async fn create_vm(
         display: Default::default(),
         iso: req.iso.filter(|s| !s.is_empty()),
         metadata: Default::default(),
+        snapshots: Vec::new(),
     };
     state
         .hv
@@ -334,6 +360,100 @@ pub async fn resume_vm(state: State<'_, AppState>, id: String) -> Result<(), Str
     state.hv.resume(&id).await.map_err(|e| e.to_string())
 }
 
+// ---- Snapshots & clones (Phase 3) ----
+//
+// `rename_all = "snake_case"` on every command with a multi-word arg
+// (`snapshot_id`, `new_name`): a bare `#[tauri::command]` matches arg keys as
+// camelCase and would fail the runtime lookup against the JS wrappers in
+// `src/lib/ipc.ts` (see `delete_vm`). Long-ops are synchronous (A6): the
+// Promise resolves on completion.
+
+/// The reconciled snapshot tree for a VM (metadata joined with the qcow2
+/// image's internal snapshots). Read on demand, never in the 2s library poll.
+#[tauri::command]
+pub async fn list_snapshots(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<SnapshotDto>, String> {
+    state
+        .hv
+        .list_snapshots(&id)
+        .await
+        .map(|nodes| nodes.into_iter().map(SnapshotDto::from).collect())
+        .map_err(|e| e.to_string())
+}
+
+/// Take a snapshot (live via QMP job or offline via `qemu-img`, routed below
+/// the boundary). Top-level (`parent = None`), no notes from this surface.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn create_snapshot(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+) -> Result<SnapshotDto, String> {
+    state
+        .hv
+        .create_snapshot(&id, &name, None, "")
+        .await
+        .map(|snap| {
+            SnapshotDto::from(SnapshotNode {
+                meta: snap,
+                present_in_qcow2: true,
+                children: Vec::new(),
+            })
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Restore (revert) a snapshot. Disk-only, stopped-only (A7); refused for a
+/// live VM or a VM with linked clones, below the boundary.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn restore_snapshot(
+    state: State<'_, AppState>,
+    id: String,
+    snapshot_id: String,
+) -> Result<(), String> {
+    let snapshot_id = Uuid::parse_str(&snapshot_id).map_err(|e| e.to_string())?;
+    state
+        .hv
+        .restore_snapshot(&id, snapshot_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Delete a snapshot (live or offline), re-parenting its children onto the
+/// grandparent below the boundary.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn delete_snapshot(
+    state: State<'_, AppState>,
+    id: String,
+    snapshot_id: String,
+) -> Result<(), String> {
+    let snapshot_id = Uuid::parse_str(&snapshot_id).map_err(|e| e.to_string())?;
+    state
+        .hv
+        .delete_snapshot(&id, snapshot_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Clone a VM into a brand-new VM (full = deep copy, linked = CoW overlay).
+/// Stopped-source-only; returns the new VM's config as a normal `VmConfigDto`.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn clone_vm(
+    state: State<'_, AppState>,
+    id: String,
+    new_name: String,
+    linked: bool,
+) -> Result<VmConfigDto, String> {
+    state
+        .hv
+        .clone_vm(&id, &new_name, linked)
+        .await
+        .map(VmConfigDto::from)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     //! Wire-shape contract for the IPC DTOs. These pin the EXACT JSON field
@@ -409,6 +529,42 @@ mod tests {
         assert_eq!(keys(&v["network"]), ["mac", "mode", "port_forwards"]);
         assert_eq!(v["network"]["mode"], json!("host-only")); // NetworkMode kebab
         assert_eq!(keys(&v["disks"][0]), ["backing", "path", "size_gib"]);
+    }
+
+    #[test]
+    fn snapshot_dto_wire_shape() {
+        let dto = SnapshotDto {
+            snapshot_id: "sid".into(),
+            name: "snap".into(),
+            parent_id: Some("pid".into()),
+            created_at: "2026-06-24T00:00:00Z".into(),
+            has_vm_state: true,
+            vm_state_size: 4096,
+            present_in_qcow2: true,
+        };
+        let v = serde_json::to_value(&dto).unwrap();
+        assert_eq!(
+            keys(&v),
+            [
+                "created_at",
+                "has_vm_state",
+                "name",
+                "parent_id",
+                "present_in_qcow2",
+                "snapshot_id",
+                "vm_state_size"
+            ]
+        );
+        assert_eq!(v["parent_id"], json!("pid"));
+        assert_eq!(v["has_vm_state"], json!(true));
+
+        // Top-level snapshot serializes parent_id as JSON null (not absent).
+        let root = SnapshotDto {
+            parent_id: None,
+            ..dto
+        };
+        let rv = serde_json::to_value(&root).unwrap();
+        assert_eq!(rv["parent_id"], Value::Null);
     }
 
     #[test]

@@ -1,0 +1,60 @@
+{
+    "children": [
+        {
+            "name": "file",
+            "info": {
+                "children": [
+                ],
+                "virtual-size": 459264,
+                "filename": "/tmp/vmforge-fixture.qcow2",
+                "format": "file",
+                "actual-size": 397312,
+                "format-specific": {
+                    "type": "file",
+                    "data": {
+                    }
+                },
+                "dirty-flag": false
+            }
+        }
+    ],
+    "snapshots": [
+        {
+            "icount": 0,
+            "vm-clock-nsec": 0,
+            "name": "550e8400-e29b-41d4-a716-446655440000",
+            "date-sec": 1782342711,
+            "date-nsec": 276293000,
+            "vm-clock-sec": 0,
+            "id": "1",
+            "vm-state-size": 0
+        },
+        {
+            "icount": 0,
+            "vm-clock-nsec": 0,
+            "name": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            "date-sec": 1782342711,
+            "date-nsec": 287623000,
+            "vm-clock-sec": 0,
+            "id": "2",
+            "vm-state-size": 0
+        }
+    ],
+    "virtual-size": 67108864,
+    "filename": "/tmp/vmforge-fixture.qcow2",
+    "cluster-size": 65536,
+    "format": "qcow2",
+    "actual-size": 397312,
+    "format-specific": {
+        "type": "qcow2",
+        "data": {
+            "compat": "1.1",
+            "compression-type": "zlib",
+            "lazy-refcounts": false,
+            "refcount-bits": 16,
+            "corrupt": false,
+            "extended-l2": false
+        }
+    },
+    "dirty-flag": false
+}

@@ -78,10 +78,15 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
         flag("-bios", fw.display().to_string());
     }
 
-    // Boot disk (virtio-blk).
+    // Boot disk (virtio-blk). `node-name=disk0` names the block node so live
+    // QMP snapshot jobs can target it (vmstate/devices). `-snapshot` is never
+    // emitted — that would discard writes on shutdown.
     flag(
         "-drive",
-        format!("file={},if=virtio,format=qcow2", esc(l.disk)),
+        format!(
+            "file={},if=virtio,format=qcow2,node-name=disk0",
+            esc(l.disk)
+        ),
     );
 
     // Install media as a virtio CD-ROM. `-cdrom` defaults to if=ide, which the
@@ -153,6 +158,7 @@ mod tests {
             display: Default::default(),
             iso: None,
             metadata: Default::default(),
+            snapshots: Vec::new(),
         }
     }
 
@@ -187,8 +193,61 @@ mod tests {
             "iso comma not escaped: {joined}"
         );
         assert!(
-            joined.contains("file=/vm/di,,sk.qcow2,if=virtio,format=qcow2"),
-            "disk comma not escaped: {joined}"
+            joined.contains("file=/vm/di,,sk.qcow2,if=virtio,format=qcow2,node-name=disk0"),
+            "disk comma not escaped or node-name missing: {joined}"
+        );
+    }
+
+    #[test]
+    fn boot_drive_has_node_name_disk0() {
+        // Live QMP snapshot jobs target the named block node, so the boot
+        // -drive MUST carry node-name=disk0.
+        let c = cfg();
+        let disk = PathBuf::from("/vm/disk.qcow2");
+        let sock = PathBuf::from("/vm/qmp.sock");
+        let args = build_args(&QemuLaunch {
+            config: &c,
+            accel: Accelerator::Hvf,
+            guest_arch: "aarch64",
+            disk: &disk,
+            iso: None,
+            firmware: Some(Path::new("/fw/x.fd")),
+            vnc_display: 1,
+            qmp: QmpEndpoint::UnixSocket(&sock),
+        });
+        assert_eq!(
+            find_flag(&args, "-drive"),
+            Some("file=/vm/disk.qcow2,if=virtio,format=qcow2,node-name=disk0")
+        );
+    }
+
+    #[test]
+    fn build_args_never_emits_snapshot_flag() {
+        // `-snapshot` makes QEMU write to a throwaway temp overlay, discarding
+        // all disk writes on power-off. VMForge must NEVER emit it. Guard with
+        // an ISO + port forwards present to exercise the broadest arg set.
+        let mut c = cfg();
+        c.iso = Some("/iso/alpine.iso".into());
+        c.network.port_forwards = vec![PortForward {
+            host: 2222,
+            guest: 22,
+            udp: false,
+        }];
+        let disk = PathBuf::from("/vm/disk.qcow2");
+        let sock = PathBuf::from("/vm/qmp.sock");
+        let args = build_args(&QemuLaunch {
+            config: &c,
+            accel: Accelerator::Hvf,
+            guest_arch: "aarch64",
+            disk: &disk,
+            iso: Some(Path::new("/iso/alpine.iso")),
+            firmware: Some(Path::new("/fw/x.fd")),
+            vnc_display: 1,
+            qmp: QmpEndpoint::UnixSocket(&sock),
+        });
+        assert!(
+            !args.iter().any(|a| a == "-snapshot"),
+            "build_args must never emit -snapshot: {args:?}"
         );
     }
 

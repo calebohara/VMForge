@@ -5,6 +5,7 @@ import { LibraryView } from "@/components/library/LibraryView";
 import { ConsoleView } from "@/components/console/ConsoleView";
 import { NewVmWizard } from "@/components/wizard/NewVmWizard";
 import { HardwareEditorView } from "@/components/editor/HardwareEditorView";
+import { SnapshotsView } from "@/components/snapshots/SnapshotsView";
 import type { VmActions } from "@/components/library/QuickActions";
 import { useHostCaps } from "@/hooks/useHostCaps";
 import { useVmLibrary } from "@/hooks/useVmLibrary";
@@ -16,6 +17,7 @@ type View =
   | { kind: "library" }
   | { kind: "wizard" }
   | { kind: "editor"; vmId: string }
+  | { kind: "snapshots"; vmId: string }
   | { kind: "console"; vmId: string; wsPort: number };
 
 function App() {
@@ -96,12 +98,35 @@ function App() {
     onDelete: () => {
       /* handled by LibraryView's confirmation dialog */
     },
+    onOpenSnapshots: (vm) => setView({ kind: "snapshots", vmId: vm.id }),
+    onClone: () => {
+      /* handled by LibraryView's clone dialog */
+    },
   };
 
   const confirmDelete = useCallback(
     (id: string, deleteDisks: boolean) =>
       void runAction(id, "Delete", () => ipc.deleteVm(id, deleteDisks)),
     [runAction],
+  );
+
+  // Clone resolves on completion so the dialog holds its "Cloning…" spinner for
+  // the whole synchronous op; on success we refresh so the new VM appears.
+  const confirmClone = useCallback(
+    async (id: string, newName: string, linked: boolean) => {
+      setBusy(id, true);
+      try {
+        const clone = await ipc.cloneVm(id, newName, linked);
+        await refresh();
+        toast.success(`Created “${clone.name}”`);
+      } catch (e) {
+        toast.error("Clone failed", { description: String(e) });
+        throw e;
+      } finally {
+        setBusy(id, false);
+      }
+    },
+    [setBusy, refresh],
   );
 
   const backToLibrary = useCallback(() => {
@@ -148,6 +173,14 @@ function App() {
           { label: "Library", onClick: backToLibrary },
           { label: "Edit" },
         ];
+      case "snapshots": {
+        const snapVm = vms.find((v) => v.id === view.vmId);
+        return [
+          { label: "Library", onClick: backToLibrary },
+          { label: snapVm?.name ?? "VM" },
+          { label: "Snapshots" },
+        ];
+      }
       case "console":
         return [
           { label: "Library", onClick: backToLibrary },
@@ -169,6 +202,7 @@ function App() {
           actions={actions}
           onCreate={() => setView({ kind: "wizard" })}
           onConfirmDelete={confirmDelete}
+          onConfirmClone={confirmClone}
         />
       )}
 
@@ -195,6 +229,17 @@ function App() {
           hostCores={hostCores}
           onClose={backToLibrary}
           onSaved={backToLibrary}
+          onOpenSnapshots={() =>
+            setView({ kind: "snapshots", vmId: view.vmId })
+          }
+        />
+      )}
+
+      {view.kind === "snapshots" && (
+        <SnapshotsView
+          vmId={view.vmId}
+          vmName={vms.find((v) => v.id === view.vmId)?.name ?? "VM"}
+          state={vms.find((v) => v.id === view.vmId)?.state ?? "stopped"}
         />
       )}
 
@@ -219,6 +264,9 @@ function App() {
             ).then(backToLibrary)
           }
           onBack={backToLibrary}
+          onOpenSnapshots={() =>
+            setView({ kind: "snapshots", vmId: view.vmId })
+          }
         />
       )}
     </AppShell>

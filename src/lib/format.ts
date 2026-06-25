@@ -111,3 +111,38 @@ export function basename(path: string): string {
   const parts = path.split(/[\\/]/);
   return parts[parts.length - 1] || path;
 }
+
+/**
+ * Human label for a snapshot's RFC3339 `created_at` timestamp. Falls back to
+ * the raw string when it isn't a parseable date.
+ */
+export function snapshotDateLabel(createdAt: string): string {
+  if (!createdAt) return "";
+  const ms = Date.parse(createdAt);
+  if (Number.isNaN(ms)) return createdAt;
+  return new Date(ms).toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/**
+ * Format a byte count as a human binary-unit string (e.g. 1536 -> "1.5 KiB").
+ * Used for snapshot RAM (`vm_state_size`). Returns "0 B" for zero/invalid.
+ */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  // No decimals for raw bytes; up to two for larger units.
+  const rounded = unit === 0 ? value : Math.round(value * 100) / 100;
+  return `${rounded} ${units[unit]}`;
+}

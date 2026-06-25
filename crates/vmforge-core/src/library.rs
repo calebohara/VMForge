@@ -16,9 +16,12 @@
 
 use crate::error::{Error, Result};
 use crate::host::Accelerator;
-use crate::model::{VmConfig, VmId, VmState, VmSummary};
+use crate::model::{DiskSpec, Snapshot, SnapshotNode, VmConfig, VmId, VmState, VmSummary};
 use crate::paths;
+use crate::storage::Qcow2Snapshot;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 /// Directory-scanned store of persisted VM configurations.
 ///
@@ -175,6 +178,12 @@ impl Library {
                     // delete/save/start. See is_safe_slug.
                     tracing::warn!(target: "vmforge_core::library", path = %config_path.display(), slug = %c.dir_slug, "skipping config with unsafe dir_slug");
                 }
+                Ok(c) if !config_disks_safe(&c) => {
+                    // Same fail-closed chokepoint for disk paths/backings: a
+                    // hand-edited disks[].path/backing could escape the root on
+                    // clone/convert/launch. See is_safe_disk_filename/backing.
+                    tracing::warn!(target: "vmforge_core::library", path = %config_path.display(), "skipping config with unsafe disk path/backing");
+                }
                 Ok(c) => out.push(c),
                 Err(e) => {
                     tracing::warn!(target: "vmforge_core::library", path = %config_path.display(), error = %e, "skipping malformed vmforge.toml");
@@ -234,6 +243,291 @@ impl Library {
         }
         Err(Error::Other("exhausted slug collision suffixes".into()))
     }
+
+    /// Full (deep) clone: `qemu-img convert -O qcow2` each source disk into a
+    /// brand-new VM directory. The result is flattened — `backing` is cleared
+    /// and snapshots are NOT carried (the convert drops internal snapshots and
+    /// our overlay is reset).
+    ///
+    /// Atomicity (A4): convert into `<disk>.partial` then rename, and write the
+    /// clone's `vmforge.toml` **LAST** so a crash mid-convert leaves only an
+    /// orphan directory with no parseable config — invisible to `load_all`.
+    ///
+    /// Single-disk scope (Phase 3): more than one disk maps to
+    /// [`Error::NotImplemented`].
+    pub async fn full_clone(&self, src_id: &VmId, new_name: &str) -> Result<VmConfig> {
+        validate_vm_name(new_name)?;
+        let src = self.load_config(src_id).await?;
+        let src_disk = single_disk(&src)?;
+
+        let src_dir = paths::vm_dir(&self.root, &src.dir_slug);
+        let src_disk_path = src_dir.join(&src_disk.path);
+
+        let slug = self.unique_slug(&slugify(new_name)).await?;
+        let dst_dir = paths::vm_dir(&self.root, &slug);
+        let config_path = dst_dir.join(paths::CONFIG_FILENAME);
+        if config_path.exists() {
+            return Err(Error::Config(format!(
+                "VM directory {} already holds a vmforge.toml",
+                dst_dir.display()
+            )));
+        }
+        tokio::fs::create_dir_all(&dst_dir).await?;
+
+        // Deep-copy into a *.partial then rename so a half-written disk never
+        // appears as the real image.
+        let final_disk = dst_dir.join(&src_disk.path);
+        let partial = dst_dir.join(format!("{}.partial", src_disk.path));
+        crate::storage::convert_qcow2(&src_disk_path, &partial).await?;
+        tokio::fs::rename(&partial, &final_disk).await?;
+
+        let now = now_rfc3339();
+        let clone = VmConfig {
+            id: Uuid::new_v4(),
+            name: new_name.to_string(),
+            schema_version: src.schema_version,
+            dir_slug: slug,
+            hardware: src.hardware.clone(),
+            disks: vec![DiskSpec {
+                path: src_disk.path.clone(),
+                size_gib: src_disk.size_gib,
+                backing: None, // flattened: full clone carries no backing
+            }],
+            network: src.network.clone(),
+            display: Default::default(),
+            iso: src.iso.clone(),
+            metadata: crate::model::VmMetadata {
+                created_at: Some(now.clone()),
+                updated_at: Some(now),
+                notes: src.metadata.notes.clone(),
+                os_hint: src.metadata.os_hint.clone(),
+            },
+            snapshots: Vec::new(), // snapshots NOT carried (A4)
+        };
+
+        // Config LAST: until this lands the dir is config-less and invisible.
+        write_config_atomic(&config_path, &clone).await?;
+        Ok(clone)
+    }
+
+    /// Linked (CoW) clone: `qemu-img create -f qcow2 --backing <rel>` an overlay
+    /// whose backing file is the source's disk, addressed **relative** to the
+    /// child's directory as `../<parent-slug>/<disk>` (forward-slash, A5). The
+    /// child's [`DiskSpec::backing`] records the same relative path.
+    ///
+    /// Single-disk scope (Phase 3): more than one disk maps to
+    /// [`Error::NotImplemented`].
+    pub async fn linked_clone(&self, src_id: &VmId, new_name: &str) -> Result<VmConfig> {
+        validate_vm_name(new_name)?;
+        let src = self.load_config(src_id).await?;
+        let src_disk = single_disk(&src)?;
+
+        let slug = self.unique_slug(&slugify(new_name)).await?;
+        let dst_dir = paths::vm_dir(&self.root, &slug);
+        let config_path = dst_dir.join(paths::CONFIG_FILENAME);
+        if config_path.exists() {
+            return Err(Error::Config(format!(
+                "VM directory {} already holds a vmforge.toml",
+                dst_dir.display()
+            )));
+        }
+        tokio::fs::create_dir_all(&dst_dir).await?;
+
+        // Backing path is relative to the CHILD directory; forward-slash so it
+        // is stable across platforms in the qcow2 header and our config.
+        let backing_rel = format!("../{}/{}", src.dir_slug, src_disk.path);
+
+        let child_disk = dst_dir.join(&src_disk.path);
+        crate::storage::create_linked_overlay(&child_disk, &backing_rel).await?;
+
+        let now = now_rfc3339();
+        let clone = VmConfig {
+            id: Uuid::new_v4(),
+            name: new_name.to_string(),
+            schema_version: src.schema_version,
+            dir_slug: slug,
+            hardware: src.hardware.clone(),
+            disks: vec![DiskSpec {
+                path: src_disk.path.clone(),
+                size_gib: src_disk.size_gib,
+                backing: Some(backing_rel),
+            }],
+            network: src.network.clone(),
+            display: Default::default(),
+            iso: src.iso.clone(),
+            metadata: crate::model::VmMetadata {
+                created_at: Some(now.clone()),
+                updated_at: Some(now),
+                notes: src.metadata.notes.clone(),
+                os_hint: src.metadata.os_hint.clone(),
+            },
+            snapshots: Vec::new(),
+        };
+
+        write_config_atomic(&config_path, &clone).await?;
+        Ok(clone)
+    }
+
+    /// Slugs of every persisted VM that has a disk whose `backing` path resolves
+    /// (relative to that VM's own directory) to `target_disk`. Used by linked-
+    /// clone parent protection (A5): a parent with dependents may not be
+    /// started, deleted, or restored.
+    ///
+    /// `target_disk` is matched by canonicalized absolute path where possible,
+    /// falling back to a lexical comparison so the check still works for paths
+    /// that do not yet exist on disk.
+    pub async fn dependents_of(&self, target_disk: &Path) -> Result<Vec<String>> {
+        let target = normalize_path(target_disk);
+        let mut out = Vec::new();
+        for config in self.load_all().await? {
+            let vm_dir = paths::vm_dir(&self.root, &config.dir_slug);
+            for disk in &config.disks {
+                let Some(backing) = &disk.backing else {
+                    continue;
+                };
+                // Backing is relative to the VM's directory.
+                let resolved = normalize_path(&vm_dir.join(backing));
+                if resolved == target {
+                    out.push(config.dir_slug.clone());
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The single disk of a config, or [`Error::NotImplemented`] for the multi-disk
+/// case (Phase 3 clones/snapshots are single-disk only).
+fn single_disk(config: &VmConfig) -> Result<&DiskSpec> {
+    match config.disks.as_slice() {
+        [d] => Ok(d),
+        [] => Err(Error::Config(format!(
+            "VM {} has no disks to clone",
+            config.name
+        ))),
+        _ => Err(Error::NotImplemented("multi-disk clone")),
+    }
+}
+
+/// Lexically normalize a path (resolve `.`/`..` segments) without touching the
+/// filesystem, then canonicalize against any existing prefix so two paths that
+/// reach the same file compare equal regardless of `..`-style relativity.
+fn normalize_path(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    // Best-effort canonicalize (collapses symlinks for files that exist);
+    // fall back to the lexical form for not-yet-created paths.
+    std::fs::canonicalize(&out).unwrap_or(out)
+}
+
+/// Reconcile our snapshot metadata against the qcow2 image's internal snapshot
+/// list, producing the tree-overlay nodes consumed by the UI. Pure.
+///
+/// Join key (A1): the qcow2 `tag` (`Qcow2Snapshot::name`) equals our
+/// `Snapshot.id.to_string()`.
+///
+/// - A metadata entry present in qcow2 → `present_in_qcow2 = true`.
+/// - A metadata entry absent from qcow2 (a metadata orphan) →
+///   `present_in_qcow2 = false`, still surfaced.
+/// - A qcow2 snapshot with no matching metadata (a qcow2 orphan) → synthesized
+///   as a parent-less node (`parent = None`).
+/// - Child links are resolved from each node's `parent`. A `parent` pointing at
+///   an id that is not itself a node is treated as a root (degrades to flat).
+pub fn reconcile(meta: &[Snapshot], qcow2: &[Qcow2Snapshot]) -> Vec<SnapshotNode> {
+    // Index qcow2 entries by our-uuid-string tag for presence + size backfill.
+    let qcow2_by_tag: HashMap<&str, &Qcow2Snapshot> =
+        qcow2.iter().map(|q| (q.name.as_str(), q)).collect();
+    let meta_ids: HashSet<Uuid> = meta.iter().map(|s| s.id).collect();
+
+    let mut nodes: Vec<SnapshotNode> = Vec::new();
+
+    // Metadata-driven nodes (preserve order). Backfill the authoritative qcow2
+    // `vm-state-size` onto present nodes — create-time metadata stores 0, so the
+    // UI would otherwise show "0 bytes" for a live (RAM-carrying) snapshot.
+    for s in meta {
+        let q = qcow2_by_tag.get(s.id.to_string().as_str()).copied();
+        let mut node_meta = s.clone();
+        if let Some(q) = q {
+            node_meta.vm_state_size = q.vm_state_size;
+        }
+        nodes.push(SnapshotNode {
+            present_in_qcow2: q.is_some(),
+            meta: node_meta,
+            children: Vec::new(),
+        });
+    }
+
+    // qcow2 orphans (a tag with no metadata) → parent-less synthetic nodes.
+    for q in qcow2 {
+        let Ok(qid) = q.name.parse::<Uuid>() else {
+            // A tag that isn't one of our uuids isn't part of our tree.
+            continue;
+        };
+        if meta_ids.contains(&qid) {
+            continue;
+        }
+        nodes.push(SnapshotNode {
+            meta: Snapshot {
+                id: qid,
+                name: q.name.clone(),
+                parent: None,
+                created_at: rfc3339_from_sec(q.date_sec),
+                has_vm_state: q.vm_state_size > 0,
+                notes: String::new(),
+                vm_state_size: q.vm_state_size,
+            },
+            present_in_qcow2: true,
+            children: Vec::new(),
+        });
+    }
+
+    // Resolve child links. A parent id that names no node (dangling) is treated
+    // as None so the node still surfaces as a root.
+    let present_ids: HashSet<Uuid> = nodes.iter().map(|n| n.meta.id).collect();
+    let mut children: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for n in &nodes {
+        if let Some(parent) = n.meta.parent {
+            if present_ids.contains(&parent) {
+                children.entry(parent).or_default().push(n.meta.id);
+            }
+        }
+    }
+    for n in &mut nodes {
+        if let Some(kids) = children.remove(&n.meta.id) {
+            n.children = kids;
+        }
+    }
+
+    nodes
+}
+
+/// Remove `removed` from `meta`, re-parenting its direct children onto its
+/// parent (their grandparent). A child of a top-level snapshot becomes
+/// top-level itself (`parent = None`). Pure, in place.
+pub fn reparent_on_delete(meta: &mut Vec<Snapshot>, removed: Uuid) {
+    let grandparent = meta.iter().find(|s| s.id == removed).and_then(|s| s.parent);
+    for s in meta.iter_mut() {
+        if s.parent == Some(removed) {
+            s.parent = grandparent;
+        }
+    }
+    meta.retain(|s| s.id != removed);
+}
+
+/// RFC3339 UTC string from Unix epoch seconds (for synthesized qcow2-orphan
+/// timestamps). Negative seconds (pre-epoch) clamp to the epoch.
+fn rfc3339_from_sec(secs: i64) -> String {
+    format_rfc3339_utc(secs.max(0) as u64)
 }
 
 /// Atomically write a config to `config_path` via a sibling temp file + rename.
@@ -263,7 +557,7 @@ async fn write_config_atomic(config_path: &Path, config: &VmConfig) -> Result<()
 /// Self-contained (no `chrono`/`time` dependency) civil-time conversion of the
 /// Unix epoch seconds, using the standard algorithm for the proleptic
 /// Gregorian calendar.
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -387,6 +681,45 @@ pub fn is_safe_slug(slug: &str) -> bool {
     !slug.is_empty() && slug == slugify(slug)
 }
 
+/// A disk filename (`disks[].path`) must be a single flat segment under the VM
+/// dir: non-empty, no separators, not `.`/`..`, and not a `-`-leading token
+/// (which `qemu-img` would parse as an option). Read verbatim from
+/// `vmforge.toml`, so guard it fail-closed before any qemu-img/launch use.
+pub fn is_safe_disk_filename(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('-')
+        && !p.contains('/')
+        && !p.contains('\\')
+        && p != "."
+        && p != ".."
+}
+
+/// A persisted `disks[].backing` is safe iff, opened from a VM directory (one
+/// level under the library root), it resolves WITHIN the root. VMForge only ever
+/// writes `../<parent-slug>/<file>` (linked clones); a bare safe filename is
+/// also accepted. Absolute paths, backslashes, `-`-leading, or any other `..`
+/// shape are rejected so a hand-edited config can't point a CoW overlay outside
+/// the library.
+pub fn is_safe_backing(b: &str) -> bool {
+    if b.is_empty() || b.starts_with('-') || b.contains('\\') {
+        return false;
+    }
+    match b.split('/').collect::<Vec<_>>().as_slice() {
+        [file] => is_safe_disk_filename(file),
+        ["..", slug, file] => is_safe_slug(slug) && is_safe_disk_filename(file),
+        _ => false,
+    }
+}
+
+/// True iff every disk path/backing in `config` is safe (see
+/// [`is_safe_disk_filename`] / [`is_safe_backing`]). The `load_all` chokepoint.
+pub fn config_disks_safe(config: &VmConfig) -> bool {
+    config
+        .disks
+        .iter()
+        .all(|d| is_safe_disk_filename(&d.path) && d.backing.as_deref().is_none_or(is_safe_backing))
+}
+
 /// True iff the only differences between two configs are runtime-safe to apply
 /// while the VM is live — i.e. `name` and/or `metadata`. Any change to
 /// hardware, disks, network, display, iso, id, slug, or schema makes it unsafe.
@@ -456,6 +789,7 @@ mod tests {
                 notes: "hello".into(),
                 os_hint: Some("alpine".into()),
             },
+            snapshots: Vec::new(),
         }
     }
 
@@ -912,5 +1246,367 @@ mod tests {
             Error::VmNotFound(_)
         ));
         assert!(lib.delete_vm(&id, true).await.is_err());
+    }
+
+    #[test]
+    fn disk_path_and_backing_safety() {
+        assert!(is_safe_disk_filename("disk.qcow2"));
+        assert!(!is_safe_disk_filename(""));
+        assert!(!is_safe_disk_filename("-x.qcow2")); // qemu-img option injection
+        assert!(!is_safe_disk_filename("a/b.qcow2"));
+        assert!(!is_safe_disk_filename("..\\b"));
+        assert!(!is_safe_disk_filename(".."));
+
+        // Backing: a bare filename or exactly `../<slug>/<file>` is allowed.
+        assert!(is_safe_backing("disk.qcow2"));
+        assert!(is_safe_backing("../alpine-vm/disk.qcow2"));
+        assert!(!is_safe_backing("../../etc/passwd"));
+        assert!(!is_safe_backing("/etc/shadow"));
+        assert!(!is_safe_backing("../Bad Slug/disk.qcow2")); // slug not canonical
+        assert!(!is_safe_backing("-x"));
+    }
+
+    #[tokio::test]
+    async fn load_all_skips_unsafe_disk_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = Library::new(tmp.path().to_path_buf());
+        let dir = tmp.path().join("evil-disk");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let id = Uuid::new_v4();
+        // Valid slug, but a disk path that escapes the VM dir.
+        let toml = format!(
+            "id = \"{id}\"\nname = \"Evil Disk\"\ndir_slug = \"evil-disk\"\n\n[[disks]]\npath = \"../../escape.qcow2\"\nsize_gib = 1\n"
+        );
+        tokio::fs::write(dir.join(paths::CONFIG_FILENAME), toml)
+            .await
+            .unwrap();
+        assert!(lib.list_vms().await.unwrap().is_empty());
+        assert!(matches!(
+            lib.load_config(&id).await.unwrap_err(),
+            Error::VmNotFound(_)
+        ));
+    }
+
+    // ====================================================================
+    // Phase 3 — clones, dependents, reconcile, reparent
+    // ====================================================================
+
+    use crate::storage::Qcow2Snapshot;
+
+    fn snap(id: Uuid, parent: Option<Uuid>) -> Snapshot {
+        Snapshot {
+            id,
+            name: format!("snap-{}", &id.to_string()[..8]),
+            parent,
+            created_at: "2026-06-24T00:00:00Z".into(),
+            has_vm_state: false,
+            notes: String::new(),
+            vm_state_size: 0,
+        }
+    }
+
+    fn qcow2(name: &str) -> Qcow2Snapshot {
+        Qcow2Snapshot {
+            id: "1".into(),
+            name: name.into(),
+            date_sec: 1_782_322_800,
+            date_nsec: 0,
+            vm_state_size: 0,
+            vm_clock_nsec: 0,
+        }
+    }
+
+    // ---- full_clone: new id/slug, backing=None, snapshots empty, src untouched
+    #[tokio::test]
+    async fn full_clone_flattens_and_resets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let lib = Library::new(tmp.path().to_path_buf());
+
+        let mut src = sample_config();
+        src.id = Uuid::new_v4();
+        // Give the source a snapshot to prove clones don't carry them.
+        src.snapshots = vec![snap(Uuid::new_v4(), None)];
+        let src = lib.create_vm(src).await.unwrap();
+        // Put known bytes in the source disk so we can assert it's untouched and
+        // that convert (cp) reproduced them.
+        let src_disk = tmp.path().join(&src.dir_slug).join("disk.qcow2");
+        tokio::fs::write(&src_disk, b"SOURCEDISK").await.unwrap();
+
+        let clone = lib.full_clone(&src.id, "Cloned VM").await.unwrap();
+
+        assert_ne!(clone.id, src.id, "clone gets a fresh id");
+        assert_eq!(clone.dir_slug, "cloned-vm");
+        assert_eq!(clone.name, "Cloned VM");
+        assert_eq!(clone.disks.len(), 1);
+        assert_eq!(clone.disks[0].backing, None, "full clone is flattened");
+        assert!(clone.snapshots.is_empty(), "snapshots are NOT carried");
+        assert!(clone.metadata.created_at.is_some());
+        assert!(clone.metadata.updated_at.is_some());
+
+        // The clone disk exists and is NOT a *.partial.
+        let clone_dir = tmp.path().join(&clone.dir_slug);
+        assert!(clone_dir.join("disk.qcow2").exists());
+        assert!(
+            !clone_dir.join("disk.qcow2.partial").exists(),
+            "partial must be renamed away"
+        );
+        // convert copied the source bytes.
+        let copied = tokio::fs::read(clone_dir.join("disk.qcow2")).await.unwrap();
+        assert_eq!(&copied, b"SOURCEDISK");
+        // Source disk untouched.
+        let src_after = tokio::fs::read(&src_disk).await.unwrap();
+        assert_eq!(&src_after, b"SOURCEDISK", "source disk must be untouched");
+        // Source config still has its snapshot (clone didn't mutate it).
+        let src_reloaded = lib.load_config(&src.id).await.unwrap();
+        assert_eq!(src_reloaded.snapshots.len(), 1);
+
+        // The clone is loadable by id.
+        let loaded = lib.load_config(&clone.id).await.unwrap();
+        assert_eq!(loaded.dir_slug, "cloned-vm");
+    }
+
+    // ---- full_clone toml-last: a convert failure leaves no adoptable config
+    #[tokio::test]
+    async fn full_clone_convert_failure_leaves_no_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let lib = Library::new(tmp.path().to_path_buf());
+
+        let mut src = sample_config();
+        src.id = Uuid::new_v4();
+        let src = lib.create_vm(src).await.unwrap();
+
+        // Force the convert subcommand to fail; the partial must never be
+        // renamed and the clone's vmforge.toml (written LAST) must not exist.
+        std::env::set_var("MOCK_CONVERT_FAIL", "1");
+        let res = lib.full_clone(&src.id, "Cloned VM").await;
+        std::env::remove_var("MOCK_CONVERT_FAIL");
+        assert!(res.is_err(), "convert failure must propagate");
+
+        // The orphan directory (if created) has NO vmforge.toml → invisible to
+        // load_all, so no half-baked clone is adoptable.
+        let summaries = lib.list_vms().await.unwrap();
+        assert_eq!(summaries.len(), 1, "only the source VM is visible");
+        let clone_dir = tmp.path().join("cloned-vm");
+        assert!(
+            !clone_dir.join(paths::CONFIG_FILENAME).exists(),
+            "no config may be written on convert failure"
+        );
+        assert!(
+            !clone_dir.join("disk.qcow2").exists(),
+            "no real disk on convert failure (partial only, if any)"
+        );
+    }
+
+    // ---- linked_clone: relative backing string + dependents_of resolution
+    #[tokio::test]
+    async fn linked_clone_sets_relative_backing_and_dependents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let lib = Library::new(tmp.path().to_path_buf());
+
+        let mut src = sample_config();
+        src.id = Uuid::new_v4();
+        let src = lib.create_vm(src).await.unwrap();
+
+        let clone = lib.linked_clone(&src.id, "Linked Child").await.unwrap();
+        assert_eq!(clone.dir_slug, "linked-child");
+        assert_eq!(
+            clone.disks[0].backing.as_deref(),
+            Some("../alpine-vm/disk.qcow2"),
+            "backing must be ../<parent-slug>/<disk>"
+        );
+        assert!(clone.snapshots.is_empty());
+        // The overlay disk file was created.
+        assert!(tmp.path().join("linked-child").join("disk.qcow2").exists());
+
+        // dependents_of(parent disk) → the child's slug.
+        let parent_disk = tmp.path().join(&src.dir_slug).join("disk.qcow2");
+        let deps = lib.dependents_of(&parent_disk).await.unwrap();
+        assert_eq!(deps, vec!["linked-child".to_string()]);
+
+        // An unrelated disk has no dependents.
+        let other = tmp.path().join("nowhere").join("disk.qcow2");
+        assert!(lib.dependents_of(&other).await.unwrap().is_empty());
+    }
+
+    // ---- dependents_of: resolves relative backing across multiple VMs
+    #[tokio::test]
+    async fn dependents_of_resolves_multiple() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let lib = Library::new(tmp.path().to_path_buf());
+
+        let mut parent = sample_config();
+        parent.id = Uuid::new_v4();
+        let parent = lib.create_vm(parent).await.unwrap();
+
+        let c1 = lib.linked_clone(&parent.id, "Child One").await.unwrap();
+        let c2 = lib.linked_clone(&parent.id, "Child Two").await.unwrap();
+
+        let parent_disk = tmp.path().join(&parent.dir_slug).join("disk.qcow2");
+        let mut deps = lib.dependents_of(&parent_disk).await.unwrap();
+        deps.sort();
+        assert_eq!(deps, vec![c1.dir_slug.clone(), c2.dir_slug.clone()]);
+    }
+
+    // ---- multi-disk clone is NotImplemented (single-disk Phase-3 scope)
+    #[tokio::test]
+    async fn clone_multi_disk_is_not_implemented() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = crate::test_support::mock_qemu_img_full().await;
+        let lib = Library::new(tmp.path().to_path_buf());
+
+        let mut src = sample_config();
+        src.id = Uuid::new_v4();
+        src.disks.push(DiskSpec {
+            path: "disk2.qcow2".into(),
+            size_gib: 4,
+            backing: None,
+        });
+        let src = lib.create_vm(src).await.unwrap();
+
+        assert!(matches!(
+            lib.full_clone(&src.id, "X").await.unwrap_err(),
+            Error::NotImplemented(_)
+        ));
+        assert!(matches!(
+            lib.linked_clone(&src.id, "Y").await.unwrap_err(),
+            Error::NotImplemented(_)
+        ));
+    }
+
+    // ---- [[snapshots]] toml round-trip ----
+    #[test]
+    fn snapshots_toml_round_trip() {
+        let mut c = sample_config();
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        c.snapshots = vec![
+            Snapshot {
+                id: root,
+                name: "base".into(),
+                parent: None,
+                created_at: "2026-06-24T01:00:00Z".into(),
+                has_vm_state: true,
+                notes: "live root".into(),
+                vm_state_size: 4096,
+            },
+            snap(child, Some(root)),
+        ];
+        let s = Library::to_toml(&c).unwrap();
+        assert!(
+            s.contains("[[snapshots]]"),
+            "expected [[snapshots]] in:\n{s}"
+        );
+        let back = Library::from_toml(&s).unwrap();
+        assert_eq!(back.snapshots.len(), 2);
+        assert_eq!(back.snapshots[0].id, root);
+        assert_eq!(back.snapshots[0].name, "base");
+        assert!(back.snapshots[0].has_vm_state);
+        assert_eq!(back.snapshots[0].vm_state_size, 4096);
+        assert_eq!(back.snapshots[1].parent, Some(root));
+    }
+
+    // ---- Phase-2 config (no snapshots key) → empty array ----
+    #[test]
+    fn phase2_config_yields_empty_snapshots() {
+        let minimal = r#"
+            id = "00000000-0000-0000-0000-000000000000"
+            name = "Legacy"
+            dir_slug = "legacy"
+        "#;
+        let c = Library::from_toml(minimal).unwrap();
+        assert!(
+            c.snapshots.is_empty(),
+            "Phase-2 config must load with an empty snapshots array"
+        );
+    }
+
+    // ---- reconcile: both orphan directions + presence flags + child links ----
+    #[test]
+    fn reconcile_orphans_both_directions() {
+        let in_both = Uuid::new_v4();
+        let meta_only = Uuid::new_v4(); // metadata orphan (absent from qcow2)
+        let child = Uuid::new_v4();
+        // qcow2 orphan: a tag with no metadata, but still one of our uuids.
+        let qcow2_only = Uuid::new_v4();
+
+        let meta = vec![
+            snap(in_both, None),
+            snap(meta_only, None),
+            snap(child, Some(in_both)),
+        ];
+        let qcow2_list = vec![qcow2(&in_both.to_string()), qcow2(&qcow2_only.to_string())];
+
+        let nodes = reconcile(&meta, &qcow2_list);
+        // 3 metadata nodes + 1 qcow2-orphan node.
+        assert_eq!(nodes.len(), 4);
+
+        let find = |id: Uuid| nodes.iter().find(|n| n.meta.id == id).unwrap();
+
+        // Present in both → present_in_qcow2 = true; has the child link.
+        let n_both = find(in_both);
+        assert!(n_both.present_in_qcow2);
+        assert_eq!(n_both.children, vec![child]);
+
+        // Metadata orphan → present_in_qcow2 = false, surfaced as a root.
+        let n_meta = find(meta_only);
+        assert!(!n_meta.present_in_qcow2);
+        assert!(n_meta.meta.parent.is_none());
+
+        // qcow2 orphan → synthesized parent-less node, present in qcow2.
+        let n_q = find(qcow2_only);
+        assert!(n_q.present_in_qcow2);
+        assert!(n_q.meta.parent.is_none());
+
+        // Child node: present_in_qcow2 false (not in qcow2 list), parent links.
+        let n_child = find(child);
+        assert!(!n_child.present_in_qcow2);
+        assert_eq!(n_child.meta.parent, Some(in_both));
+    }
+
+    // A qcow2 tag that is not one of our uuids is ignored entirely.
+    #[test]
+    fn reconcile_ignores_foreign_qcow2_tags() {
+        let meta: Vec<Snapshot> = vec![];
+        let foreign = vec![qcow2("not-a-uuid-tag")];
+        let nodes = reconcile(&meta, &foreign);
+        assert!(nodes.is_empty(), "foreign tag must not create a node");
+    }
+
+    // ---- reparent_on_delete: children adopt grandparent ----
+    #[test]
+    fn reparent_on_delete_children_to_grandparent() {
+        let gp = Uuid::new_v4();
+        let parent = Uuid::new_v4();
+        let c1 = Uuid::new_v4();
+        let c2 = Uuid::new_v4();
+
+        let mut meta = vec![
+            snap(gp, None),
+            snap(parent, Some(gp)),
+            snap(c1, Some(parent)),
+            snap(c2, Some(parent)),
+        ];
+        reparent_on_delete(&mut meta, parent);
+
+        assert!(!meta.iter().any(|s| s.id == parent), "parent removed");
+        let find = |id: Uuid| meta.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(find(c1).parent, Some(gp), "child reparented to grandparent");
+        assert_eq!(find(c2).parent, Some(gp));
+    }
+
+    // Deleting a top-level snapshot makes its children top-level (parent=None).
+    #[test]
+    fn reparent_on_delete_top_level_children_become_roots() {
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut meta = vec![snap(root, None), snap(child, Some(root))];
+        reparent_on_delete(&mut meta, root);
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].id, child);
+        assert_eq!(meta[0].parent, None, "child becomes a root");
     }
 }
