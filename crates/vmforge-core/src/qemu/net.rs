@@ -98,9 +98,12 @@ fn user_mode_args(net: &NetworkConfig) -> Result<Vec<String>, NetworkBuildError>
         ));
     }
 
+    // e1000: an Intel NIC Windows and Linux both have built-in drivers for, so
+    // the guest has working networking out of the box (virtio-net would need
+    // virtio-win on Windows).
     let device = match &net.mac {
-        Some(mac) => format!("virtio-net-pci,netdev=net0,mac={mac}"),
-        None => "virtio-net-pci,netdev=net0".to_string(),
+        Some(mac) => format!("e1000,netdev=net0,mac={mac}"),
+        None => "e1000,netdev=net0".to_string(),
     };
 
     Ok(vec!["-netdev".into(), netdev, "-device".into(), device])
@@ -222,7 +225,7 @@ mod tests {
             after(&args, "-netdev"),
             Some("user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22")
         );
-        assert_eq!(after(&args, "-device"), Some("virtio-net-pci,netdev=net0"));
+        assert_eq!(after(&args, "-device"), Some("e1000,netdev=net0"));
     }
 
     // ---- expose_lan → bind-all (empty host addr) ----
@@ -250,7 +253,7 @@ mod tests {
         );
         assert_eq!(
             after(&args, "-device"),
-            Some("virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56")
+            Some("e1000,netdev=net0,mac=52:54:00:12:34:56")
         );
     }
 
@@ -260,7 +263,7 @@ mod tests {
         let net = NetworkConfig::default();
         let args = network_args(&net, Accelerator::Whpx).unwrap();
         assert_eq!(after(&args, "-netdev"), Some("user,id=net0"));
-        assert_eq!(after(&args, "-device"), Some("virtio-net-pci,netdev=net0"));
+        assert_eq!(after(&args, "-device"), Some("e1000,netdev=net0"));
     }
 
     // ---- bridged rejected with a needs-permission reason, no NAT fallback ----

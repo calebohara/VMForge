@@ -86,24 +86,34 @@ pub fn build_args(l: &QemuLaunch) -> Vec<String> {
         );
     }
 
-    // Boot disk (virtio-blk). `node-name=disk0` names the block node so live
-    // QMP snapshot jobs can target it (vmstate/devices). `-snapshot` is never
-    // emitted — that would discard writes on shutdown.
+    // Storage on a SATA/AHCI controller. Windows (and Linux) installers have
+    // built-in AHCI drivers, so a stock ISO sees the disk + CD-ROM with no
+    // virtio-win drivers needed. `node-name=disk0` names the block node so live
+    // QMP snapshot jobs can target it. `-snapshot` is never emitted — that would
+    // discard writes on shutdown. Boot order is set via `bootindex` (OVMF-aware).
+    flag("-device", "ich9-ahci,id=ahci".to_string());
     flag(
         "-drive",
         format!(
-            "file={},if=virtio,format=qcow2,node-name=disk0",
+            "if=none,id=hd0,file={},format=qcow2,node-name=disk0",
             esc(l.disk)
         ),
     );
+    flag(
+        "-device",
+        "ide-hd,drive=hd0,bus=ahci.0,bootindex=1".to_string(),
+    );
 
-    // Install media as a virtio CD-ROM.
+    // Install media as a SATA CD-ROM (bootindex 0 → boot the installer first).
     if let Some(iso) = l.iso {
         flag(
             "-drive",
-            format!("file={},if=virtio,media=cdrom,format=raw", esc(iso)),
+            format!("if=none,id=cd0,media=cdrom,file={},format=raw", esc(iso)),
         );
-        flag("-boot", "order=dc".to_string());
+        flag(
+            "-device",
+            "ide-cd,drive=cd0,bus=ahci.1,bootindex=0".to_string(),
+        );
     }
 
     // Input devices for the VNC console (q35 has a built-in VGA adapter, so no
@@ -235,25 +245,33 @@ mod tests {
         );
         let joined = args.join(" ");
         assert!(
-            joined.contains("file=/isos/weird,,name.iso,if=virtio,media=cdrom,format=raw"),
+            joined.contains("file=/isos/weird,,name.iso,format=raw"),
             "iso comma not escaped: {joined}"
         );
         assert!(
-            joined.contains("file=/vm/di,,sk.qcow2,if=virtio,format=qcow2,node-name=disk0"),
+            joined.contains("file=/vm/di,,sk.qcow2,format=qcow2,node-name=disk0"),
             "disk comma not escaped or node-name missing: {joined}"
         );
     }
 
     #[test]
-    fn boot_drive_has_node_name_disk0() {
-        // Live QMP snapshot jobs target the named block node, so the boot
-        // -drive MUST carry node-name=disk0. With SeaBIOS (no pflash) the boot
-        // disk is the first -drive.
+    fn boot_disk_is_ahci_with_node_name_disk0() {
+        // Live QMP snapshot jobs target node-name=disk0; the disk is a SATA
+        // (AHCI) drive so a stock OS installer sees it.
         let disk = PathBuf::from("/vm/disk.qcow2");
         let args = build(&cfg(), Accelerator::Whpx, &disk, None, None, vec![], false);
-        assert_eq!(
-            find_flag(&args, "-drive"),
-            Some("file=/vm/disk.qcow2,if=virtio,format=qcow2,node-name=disk0")
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("-device ich9-ahci,id=ahci"),
+            "missing AHCI controller: {joined}"
+        );
+        assert!(
+            joined.contains("if=none,id=hd0,file=/vm/disk.qcow2,format=qcow2,node-name=disk0"),
+            "boot disk drive wrong: {joined}"
+        );
+        assert!(
+            joined.contains("-device ide-hd,drive=hd0,bus=ahci.0,bootindex=1"),
+            "boot disk device wrong: {joined}"
         );
     }
 
@@ -317,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn iso_attaches_virtio_cdrom() {
+    fn iso_attaches_sata_cdrom_bootindex_first() {
         let mut c = cfg();
         c.iso = Some("/iso/win.iso".into());
         let disk = PathBuf::from("/vm/disk.qcow2");
@@ -331,8 +349,16 @@ mod tests {
             false,
         );
         let joined = args.join(" ");
-        assert!(joined.contains("file=/iso/win.iso,if=virtio,media=cdrom,format=raw"));
-        assert_eq!(find_flag(&args, "-boot"), Some("order=dc"));
+        assert!(
+            joined.contains("if=none,id=cd0,media=cdrom,file=/iso/win.iso,format=raw"),
+            "cdrom drive wrong: {joined}"
+        );
+        assert!(
+            joined.contains("-device ide-cd,drive=cd0,bus=ahci.1,bootindex=0"),
+            "cdrom device wrong: {joined}"
+        );
+        // Boot order is via bootindex now, not `-boot order`.
+        assert_eq!(find_flag(&args, "-boot"), None);
     }
 
     #[test]
