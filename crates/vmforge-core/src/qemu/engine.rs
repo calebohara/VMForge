@@ -726,7 +726,14 @@ impl QemuHypervisor {
         });
         tracing::info!(target: "vmforge_core::qemu", vm = %config.name, ?args, "launching QEMU");
 
-        let mut proc = QemuProcess::spawn(&bin, &args, &log_path, bin_dir.as_deref()).await?;
+        // Run QEMU with CWD anchored to the VM dir. Critical on Windows: QEMU
+        // resolves resource names (the default VNC keymap `en-us`) relative to
+        // the CWD before its data dir, and a GUI-launched app inherits CWD
+        // `C:\Windows\System32`, where `en-US\` is a directory — `fopen` on it
+        // yields EACCES and QEMU aborts before QMP binds. The VM dir has no such
+        // entry, so QEMU falls through to its keymaps/ data dir. See `spawn`.
+        let mut proc =
+            QemuProcess::spawn(&bin, &args, &log_path, &vm_dir, bin_dir.as_deref()).await?;
 
         // Connect QMP (the server appears shortly after spawn). Kill QEMU and
         // surface its log tail if we can't reach it.
@@ -1199,6 +1206,7 @@ mod tests {
             std::path::Path::new("/bin/sh"),
             &["-c".into(), "exit 0".into()],
             &log,
+            tmp.path(),
             None,
         )
         .await
@@ -1415,6 +1423,7 @@ mod tests {
             std::path::Path::new("/bin/sh"),
             &["-c".into(), "sleep 30".into()],
             &log,
+            tmp.path(),
             None,
         )
         .await
@@ -1493,6 +1502,7 @@ mod tests {
             std::path::Path::new("/bin/sh"),
             &["-c".into(), format!("echo \"{msg}\" 1>&2; exit 1")],
             &log_path,
+            tmp.path(),
             None,
         )
         .await

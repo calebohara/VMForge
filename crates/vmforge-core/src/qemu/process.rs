@@ -39,10 +39,21 @@ impl QemuProcess {
     /// here, so a Finder-launched `.app` with an empty inherited `PATH` still
     /// finds QEMU. `extra_path` is prepended to the child's `PATH` env (the
     /// resolved bin dir) so any QEMU helper processes are discoverable too.
+    ///
+    /// `work_dir` sets the child's **current working directory** and must be a
+    /// clean, app-owned directory (the per-VM dir). This is not cosmetic: QEMU's
+    /// `qemu_find_file` resolves resource names (e.g. the default VNC keymap
+    /// `en-us`) by trying the bare name relative to the CWD *before* its data
+    /// dir. A GUI-launched app commonly inherits CWD `C:\Windows\System32`, where
+    /// `en-US\` exists as a directory — `fopen` on it returns EACCES and QEMU
+    /// aborts with `Could not open 'en-us': Permission denied` before the QMP
+    /// server ever binds. Anchoring CWD to the VM dir (no such collision) makes
+    /// QEMU fall through to its data dir and load the keymap correctly.
     pub async fn spawn(
         bin: &Path,
         args: &[String],
         log_path: &Path,
+        work_dir: &Path,
         extra_path: Option<&Path>,
     ) -> Result<Self> {
         if let Some(parent) = log_path.parent() {
@@ -53,6 +64,7 @@ impl QemuProcess {
 
         let mut cmd = Command::new(bin);
         cmd.args(args)
+            .current_dir(work_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err))
@@ -83,5 +95,38 @@ impl QemuProcess {
     /// Await process exit.
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus> {
         self.child.wait().await.map_err(Error::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `spawn` must run the child with its CWD set to `work_dir`. Regression
+    /// guard for the Windows `en-us` keymap EACCES: QEMU resolves the default VNC
+    /// keymap relative to the CWD before its data dir, so an inherited
+    /// `C:\Windows\System32` (which has an `en-US\` directory) made QEMU abort at
+    /// launch. Runs on both platforms: the child writes a file via a *relative*
+    /// path, which lands in its CWD — so the file appearing under `work_dir`
+    /// proves `spawn` set the CWD. (Comparing path strings instead would trip on
+    /// Windows `canonicalize()` returning a `\\?\` extended-length prefix.)
+    #[tokio::test]
+    async fn spawn_runs_child_in_work_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path();
+        let log = work.join("spawn.log");
+        let (bin, args): (&str, [String; 2]) = if cfg!(windows) {
+            ("cmd", ["/C".into(), "echo ok> proof.txt".into()])
+        } else {
+            ("/bin/sh", ["-c".into(), "echo ok > proof.txt".into()])
+        };
+        let mut proc = QemuProcess::spawn(Path::new(bin), &args, &log, work, None)
+            .await
+            .expect("spawn child");
+        proc.wait().await.expect("await child");
+        assert!(
+            work.join("proof.txt").exists(),
+            "child wrote its relative file outside work_dir → CWD was not set"
+        );
     }
 }
